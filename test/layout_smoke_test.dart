@@ -5,6 +5,15 @@ import 'package:fdr_security_deposit/main.dart';
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  void signInAs(PortalState state, UserRole role) {
+    final account = credentialFor(role);
+    expect(
+      state.signIn(role, account.userId, account.password),
+      isTrue,
+      reason: 'could not sign in as ${role.name}',
+    );
+  }
+
   Future<void> pumpShell(
     WidgetTester tester,
     PortalState state,
@@ -32,7 +41,7 @@ void main() {
     testWidgets('all role dashboards lay out at ${entry.key}', (tester) async {
       final state = PortalState();
       for (final role in UserRole.values) {
-        state.switchRole(role);
+        signInAs(state, role);
         for (var nav = 0; nav < 2; nav++) {
           state.selectNav(nav);
           await pumpShell(tester, state, entry.value);
@@ -59,7 +68,8 @@ void main() {
   });
 
   testWidgets('bank receipt dialog opens', (tester) async {
-    final state = PortalState()..switchRole(UserRole.bank);
+    final state = PortalState();
+    signInAs(state, UserRole.bank);
     await pumpShell(tester, state, const Size(1440, 1000));
     final receiptFinder = find.text('Inspect Receipt').first;
     await tester.ensureVisible(receiptFinder);
@@ -72,7 +82,8 @@ void main() {
   });
 
   testWidgets('finance partial release dialog opens', (tester) async {
-    final state = PortalState()..switchRole(UserRole.finance);
+    final state = PortalState();
+    signInAs(state, UserRole.finance);
     await pumpShell(tester, state, const Size(1440, 1000));
     final releaseFinder = find
         .text('Process Settlement & Deduct Penalty')
@@ -85,10 +96,18 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('role switcher and notifications work', (tester) async {
+  testWidgets('authenticated header exposes logout and notifications', (
+    tester,
+  ) async {
     final state = PortalState();
+    signInAs(state, UserRole.institute);
     await pumpShell(tester, state, const Size(1440, 1000));
-    expect(find.text('SWITCH DEMO ROLE'), findsOneWidget);
+
+    // Role switching is only possible by signing out and back in.
+    expect(find.text('SWITCH DEMO ROLE'), findsNothing);
+    expect(find.byType(DropdownButton<UserRole>), findsNothing);
+    expect(find.text('LOGOUT / SWITCH ACCOUNT'), findsOneWidget);
+
     await tester.tap(find.byIcon(Icons.notifications_none_rounded));
     await tester.pumpAndSettle();
     expect(find.text('Notification Centre'), findsOneWidget);

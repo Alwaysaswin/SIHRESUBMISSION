@@ -3,6 +3,13 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:fdr_security_deposit/main.dart';
 
 void main() {
+  PortalState signedInAs(UserRole role) {
+    final state = PortalState();
+    final account = credentialFor(role);
+    expect(state.signIn(role, account.userId, account.password), isTrue);
+    return state;
+  }
+
   Future<void> pump(
     WidgetTester tester,
     PortalState state, {
@@ -22,7 +29,7 @@ void main() {
   testWidgets('partial release calculator approves penalty deduction', (
     tester,
   ) async {
-    final state = PortalState()..switchRole(UserRole.finance);
+    final state = signedInAs(UserRole.finance);
     final record = state.records.firstWhere(
       (item) => item.id == 'FDR-HDFC-2016-588',
     );
@@ -69,7 +76,7 @@ void main() {
   testWidgets('rule engine fast-tracks a zero-deficiency application', (
     tester,
   ) async {
-    final state = PortalState()..switchRole(UserRole.ro);
+    final state = signedInAs(UserRole.ro);
     final record = state.records.firstWhere(
       (item) => item.id == 'FDR-PNB-2016-309',
     );

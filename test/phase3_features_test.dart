@@ -5,6 +5,13 @@ import 'package:fdr_security_deposit/main.dart';
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  PortalState signedInAs(UserRole role) {
+    final state = PortalState();
+    final account = credentialFor(role);
+    expect(state.signIn(role, account.userId, account.password), isTrue);
+    return state;
+  }
+
   Future<void> pump(
     WidgetTester tester,
     PortalState state, {
@@ -63,9 +70,7 @@ void main() {
   testWidgets('bank QR scan unlocks disbursement and closes the lifecycle', (
     tester,
   ) async {
-    final state = PortalState()
-      ..switchRole(UserRole.bank)
-      ..selectNav(1);
+    final state = signedInAs(UserRole.bank)..selectNav(1);
     final target = state.releaseReady.first;
     await pump(tester, state);
 
@@ -106,9 +111,7 @@ void main() {
   testWidgets('finance analytics and audit log render live data', (
     tester,
   ) async {
-    final state = PortalState()
-      ..switchRole(UserRole.finance)
-      ..selectNav(2);
+    final state = signedInAs(UserRole.finance)..selectNav(2);
     await pump(tester, state);
 
     expect(
@@ -135,7 +138,7 @@ void main() {
   testWidgets('finance issued e-NOC registry lists certificates', (
     tester,
   ) async {
-    final state = PortalState()..switchRole(UserRole.finance);
+    final state = signedInAs(UserRole.finance);
     await pump(tester, state);
 
     expect(find.text('Issued Digital e-NOC Registry'), findsOneWidget);
@@ -185,9 +188,7 @@ void main() {
       Size(1180, 800),
       Size(900, 1000),
     ]) {
-      final state = PortalState()
-        ..switchRole(UserRole.finance)
-        ..selectNav(2);
+      final state = signedInAs(UserRole.finance)..selectNav(2);
       await pump(tester, state, size: size);
       expect(
         tester.takeException(),

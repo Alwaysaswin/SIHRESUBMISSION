@@ -3,6 +3,13 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:fdr_security_deposit/main.dart';
 
 void main() {
+  PortalState signedInAs(UserRole role) {
+    final state = PortalState();
+    final account = credentialFor(role);
+    expect(state.signIn(role, account.userId, account.password), isTrue);
+    return state;
+  }
+
   Future<void> pump(
     WidgetTester tester,
     PortalState state, {
@@ -45,7 +52,7 @@ void main() {
   testWidgets('rule engine dialog opens and enables the right path', (
     tester,
   ) async {
-    final state = PortalState()..switchRole(UserRole.ro);
+    final state = signedInAs(UserRole.ro);
     await pump(tester, state);
     final inspect = find.text('Inspect & Run Scrutiny').first;
     await tester.ensureVisible(inspect);

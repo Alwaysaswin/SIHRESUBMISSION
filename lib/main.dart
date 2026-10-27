@@ -1,7 +1,10 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:http/http.dart' as http;
 
 void main() {
   runApp(const EKoshApp());
@@ -10,6 +13,16 @@ void main() {
 /// Global text scale so the dense dashboard typography stays readable on
 /// desktop browsers without having to zoom the page.
 const double kPortalTextScale = 1.4;
+
+/// Demo OTP issued by the password recovery flow for evaluator walkthroughs.
+const String _demoOtp = '654321';
+
+/// Node/Express + MongoDB API that backs the SSO gateway and live dashboards.
+const String kApiBaseUrl = 'http://localhost:5000';
+
+/// Outcome of a database-backed SSO call. [unavailable] keeps the offline demo
+/// path working when the API cannot be reached.
+enum BackendAuthResult { success, invalidCredentials, unavailable }
 
 /// Applies the portal's global text scale. Shared with widget tests so they
 /// exercise the same typography as the running app.
@@ -175,6 +188,147 @@ enum UserRole {
   final IconData icon;
   final Color accent;
 }
+
+/// Demo single sign-on account issued to each portal persona. In production
+/// these would be provisioned by the AICTE identity service; here they gate the
+/// four dashboards so the prototype can demonstrate authenticated access.
+class PortalCredential {
+  const PortalCredential({
+    required this.role,
+    required this.userId,
+    required this.password,
+    required this.scope,
+  });
+
+  final UserRole role;
+  final String userId;
+  final String password;
+  final String scope;
+
+  /// The local part of the user ID (e.g. `principal` for
+  /// `principal@kpr.edu.in`) is accepted as a shorthand at sign-in.
+  String get shortId => userId.split('@').first;
+
+  String get maskedPassword => List.filled(password.length, '•').join();
+}
+
+const kPortalCredentials = <UserRole, PortalCredential>{
+  UserRole.institute: PortalCredential(
+    role: UserRole.institute,
+    userId: 'principal@kpr.edu.in',
+    password: 'Kpr@2026',
+    scope:
+        'Institutional FDR portfolio, new submissions, renewals and e-NOC downloads.',
+  ),
+  UserRole.bank: PortalCredential(
+    role: UserRole.bank,
+    userId: 'banknode@sbi.co.in',
+    password: 'Sbi@2026',
+    scope:
+        'Joint lien verification, e-NOC QR settlement and fund disbursement.',
+  ),
+  UserRole.ro: PortalCredential(
+    role: UserRole.ro,
+    userId: 'ro.south@aicte.gov.in',
+    password: 'RoSouth@2026',
+    scope:
+        'Regional scrutiny, extension mandates, penalties and forfeiture sanctions.',
+  ),
+  UserRole.finance: PortalCredential(
+    role: UserRole.finance,
+    userId: 'finance.hq@aicte.gov.in',
+    password: 'Finance@2026',
+    scope:
+        'Final settlement, corpus accounting, executive analytics and audit intelligence.',
+  ),
+};
+
+PortalCredential credentialFor(UserRole role) => kPortalCredentials[role]!;
+
+/// Stakeholder role string stored in the MongoDB `users` collection.
+String apiRoleFor(UserRole role) => switch (role) {
+  UserRole.institute => 'Institute Login',
+  UserRole.bank => 'Bank Node',
+  UserRole.ro => 'AICTE RO',
+  UserRole.finance => 'Finance HQ',
+};
+
+/// Dashboard module owned by a stakeholder role when the API is offline.
+String portalModuleFor(UserRole role) => switch (role) {
+  UserRole.institute => 'Portfolio & Tracker',
+  UserRole.bank => 'Verification Desk',
+  UserRole.ro => 'Scrutiny Queue',
+  UserRole.finance => 'Final Settlement',
+};
+
+/// Maps the database role string back to the typed portal role.
+UserRole? roleFromApi(String? value) => switch (value) {
+  'Institute Login' => UserRole.institute,
+  'Bank Node' => UserRole.bank,
+  'AICTE RO' => UserRole.ro,
+  'Finance HQ' => UserRole.finance,
+  _ => null,
+};
+
+/// Authenticated identity returned by `POST /api/auth/login`. The portal uses
+/// this immutable model as the single source of truth for role routing.
+class PortalUser {
+  const PortalUser({
+    required this.role,
+    required this.portalModule,
+    required this.email,
+    this.organizationName,
+    this.aicteOrIfscCode,
+  });
+
+  factory PortalUser.fromApi(
+    Map<String, dynamic> json, {
+    required UserRole fallbackRole,
+  }) {
+    return PortalUser(
+      role: roleFromApi(json['role']?.toString()) ?? fallbackRole,
+      portalModule:
+          json['portal_module']?.toString() ?? portalModuleFor(fallbackRole),
+      email: json['email']?.toString() ?? credentialFor(fallbackRole).userId,
+      organizationName: json['organization_name']?.toString(),
+      aicteOrIfscCode: json['aicte_or_ifsc_code']?.toString(),
+    );
+  }
+
+  final UserRole role;
+  final String portalModule;
+  final String email;
+  final String? organizationName;
+  final String? aicteOrIfscCode;
+}
+
+Map<String, dynamic> _jsonMap(dynamic value) =>
+    value is Map ? value.cast<String, dynamic>() : <String, dynamic>{};
+
+DateTime _apiDate(dynamic value, DateTime fallback) {
+  if (value is String) {
+    return DateTime.tryParse(value) ?? fallback;
+  }
+  return fallback;
+}
+
+double _apiDouble(dynamic value) => value is num ? value.toDouble() : 0;
+
+int _apiInt(dynamic value) => value is num ? value.toInt() : 0;
+
+/// Maps a MongoDB `lifecycle_status` onto the dashboard badge model.
+FDRStatus _statusFromApi(String? value) => switch (value) {
+  'ACTIVE_LIEN_LOCKED' => FDRStatus.activeLienLocked,
+  'MATURED_PENDING_RO' => FDRStatus.maturedPendingRO,
+  'RO_CLEARED_PENDING_FINANCE' => FDRStatus.roClearedPendingFinance,
+  'RELEASED_ENOC' => FDRStatus.releasedENOC,
+  'PARTIAL_RELEASE_APPROVED' => FDRStatus.partialReleaseApproved,
+  'FUNDS_DISBURSED' => FDRStatus.fundsDisbursed,
+  'ON_HOLD_EXTENSION' => FDRStatus.onHoldExtension,
+  'REJECTED_BY_BANK' => FDRStatus.rejectedByBank,
+  'FORFEITED_ENCASHED_BY_AICTE' => FDRStatus.forfeited,
+  _ => FDRStatus.pendingBankVerification,
+};
 
 enum FDRStatus {
   pendingBankVerification(
@@ -471,6 +625,84 @@ class StatusSlice {
   final Color color;
 }
 
+/// One Email + SMS advisory recorded by the AICTE maturity dispatch gateway.
+/// Mirrors the `notification_logs` collection in the Node backend.
+class MaturityNotificationLog {
+  const MaturityNotificationLog({
+    required this.fdrNumber,
+    required this.aicteId,
+    required this.instituteName,
+    required this.recipientEmail,
+    required this.recipientMobile,
+    required this.milestoneWindow,
+    required this.channels,
+    required this.messagePreview,
+    required this.deliveryStatus,
+    required this.triggeredBy,
+    required this.timestamp,
+    this.daysToMaturity,
+  });
+
+  final String fdrNumber;
+  final String aicteId;
+  final String instituteName;
+  final String recipientEmail;
+  final String recipientMobile;
+  final String milestoneWindow;
+  final List<String> channels;
+  final String messagePreview;
+  final String deliveryStatus;
+  final String triggeredBy;
+  final DateTime timestamp;
+  final int? daysToMaturity;
+
+  static MaturityNotificationLog fromApi(Map<String, dynamic> json) {
+    final channelsRaw = json['channels'];
+    final channels = channelsRaw is List
+        ? channelsRaw.map((channel) => channel.toString()).toList()
+        : <String>['EMAIL', 'SMS'];
+    return MaturityNotificationLog(
+      fdrNumber: json['fdr_number']?.toString() ?? 'FDR-UNKNOWN',
+      aicteId: json['aicte_id']?.toString() ?? 'N/A',
+      instituteName: json['institute_name']?.toString() ?? 'AICTE Institute',
+      recipientEmail:
+          json['recipient_email']?.toString() ?? 'institute.nodal@aicte.gov.in',
+      recipientMobile: json['recipient_mobile']?.toString() ?? 'N/A',
+      milestoneWindow: json['milestone_window']?.toString() ?? '90_DAYS',
+      channels: channels,
+      messagePreview: json['message_preview']?.toString() ?? '',
+      deliveryStatus: json['delivery_status']?.toString() ?? 'DELIVERED',
+      triggeredBy: json['triggered_by']?.toString() ?? 'AUTO_CRON_SCHEDULER',
+      timestamp:
+          DateTime.tryParse(json['timestamp']?.toString() ?? '')?.toLocal() ??
+          DateTime.now(),
+      daysToMaturity: json['days_to_maturity'] is num
+          ? (json['days_to_maturity'] as num).toInt()
+          : null,
+    );
+  }
+
+  String get milestoneShort => switch (milestoneWindow) {
+    '30_DAYS' => '30D',
+    '60_DAYS' => '60D',
+    _ => '90D',
+  };
+
+  String get milestoneLabel => switch (milestoneWindow) {
+    '30_DAYS' => '30-Day Critical',
+    '60_DAYS' => '60-Day Follow-Up',
+    _ => '90-Day Advisory',
+  };
+
+  Color get milestoneColor => switch (milestoneWindow) {
+    '30_DAYS' => AppColors.red,
+    '60_DAYS' => AppColors.orange,
+    _ => AppColors.indigo,
+  };
+
+  bool get isAutomatic => triggeredBy == 'AUTO_CRON_SCHEDULER';
+}
+
 // -----------------------------------------------------------------------------
 // Centralized state controller
 // -----------------------------------------------------------------------------
@@ -478,6 +710,7 @@ class StatusSlice {
 class PortalState extends ChangeNotifier {
   PortalState() {
     _seed();
+    _seedLocalNotificationLogs();
   }
 
   static const kprId = '1-492831';
@@ -485,23 +718,492 @@ class PortalState extends ChangeNotifier {
   UserRole _role = UserRole.institute;
   int _navIndex = 0;
   int _enocSequence = 4127;
+  bool _authenticated = false;
+  String? _signedInUserId;
+  DateTime? _lastSignInAt;
   bool maturityCronRan = false;
   int maturityCronRuns = 0;
   DateTime? lastCronRun;
   bool maturityAlertDismissed = false;
 
+  /// Live gateway ledger returned by `GET /api/notifications/logs`.
+  final List<MaturityNotificationLog> notificationLogs = [];
+  int notificationWithin90 = 0;
+  int notificationWithin60 = 0;
+  int notificationWithin30 = 0;
+  int notificationLastDispatchCount = 0;
+  bool notificationScanBusy = false;
+  bool notificationAutoChecked = false;
+  DateTime? lastNotificationScan;
+  String notificationGatewayStatus = 'STANDBY';
+
   final List<FDRRecord> records = [];
   final List<ActivityLog> activities = [];
   final List<AuditEntry> auditLog = [];
+  final Map<UserRole, String> _passwordOverrides = <UserRole, String>{};
+
+  Map<String, dynamic>? _liveDashboardData;
+  PortalUser? _currentUser;
+  bool _backendOnline = false;
 
   UserRole get role => _role;
   int get navIndex => _navIndex;
+  bool get isAuthenticated => _authenticated;
+  String? get signedInUserId => _signedInUserId;
+  DateTime? get lastSignInAt => _lastSignInAt;
+  PortalCredential get credential => credentialFor(_role);
 
-  void switchRole(UserRole value) {
-    if (_role == value) return;
-    _role = value;
+  /// Authenticated database identity; null until a successful SSO login.
+  PortalUser? get currentUser => _currentUser;
+
+  /// Latest payload returned by `GET /api/dashboard-data`, when reachable.
+  Map<String, dynamic>? get liveDashboardData => _liveDashboardData;
+
+  /// Whether the last database call succeeded.
+  bool get backendOnline => _backendOnline;
+
+  /// Returns the current SSO password, including any password that was
+  /// updated through the OTP recovery flow during this session.
+  String passwordFor(UserRole role) =>
+      _passwordOverrides[role] ?? credentialFor(role).password;
+
+  /// Validates the demo SSO credential for [role] and opens that dashboard.
+  /// Accepts either the full user ID or its local part (before `@`).
+  bool signIn(UserRole role, String userId, String password) {
+    final account = credentialFor(role);
+    final entered = userId.trim().toLowerCase();
+    final idMatches =
+        entered == account.userId.toLowerCase() ||
+        entered == account.shortId.toLowerCase();
+    if (!idMatches || password != passwordFor(role)) {
+      return false;
+    }
+    _openSession(role, account.userId);
+    return true;
+  }
+
+  void _openSession(UserRole role, String userId, {PortalUser? user}) {
+    _role = role;
+    _navIndex = 0;
+    _authenticated = true;
+    _signedInUserId = userId;
+    _currentUser =
+        user ??
+        PortalUser(
+          role: role,
+          portalModule: portalModuleFor(role),
+          email: userId,
+          organizationName: role.org,
+        );
+    _lastSignInAt = DateTime.now();
+    _log(
+      title: 'Secure sign-in verified',
+      detail:
+          '${role.personName} authenticated to the ${role.label} dashboard '
+          'via AICTE SSO as $userId.',
+      icon: Icons.verified_user_rounded,
+      color: AppColors.emeraldDark,
+    );
+    notifyListeners();
+  }
+
+  /// Authenticates against the MongoDB-backed SSO API. Falls back to the
+  /// offline demo credentials when the backend is unreachable.
+  Future<BackendAuthResult> signInWithBackend(
+    UserRole role,
+    String userId,
+    String password,
+  ) async {
+    try {
+      final response = await http
+          .post(
+            Uri.parse('$kApiBaseUrl/api/auth/login'),
+            headers: const {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'role': apiRoleFor(role),
+              'email': userId.trim(),
+              'password': password,
+            }),
+          )
+          .timeout(const Duration(seconds: 4));
+
+      if (response.statusCode == 401 || response.statusCode == 403) {
+        return BackendAuthResult.invalidCredentials;
+      }
+      if (response.statusCode != 200) {
+        return BackendAuthResult.unavailable;
+      }
+      final decoded = jsonDecode(response.body);
+      if (decoded is! Map || decoded['success'] != true) {
+        return BackendAuthResult.invalidCredentials;
+      }
+      final userJson = _jsonMap(decoded['user']);
+      final user = PortalUser.fromApi(userJson, fallbackRole: role);
+      _backendOnline = true;
+      _openSession(user.role, user.email, user: user);
+      await fetchDashboardData();
+      return BackendAuthResult.success;
+    } catch (_) {
+      _backendOnline = false;
+      return BackendAuthResult.unavailable;
+    }
+  }
+
+  /// Persists a new password for [role] through
+  /// `PATCH /api/auth/reset-password`.
+  Future<BackendAuthResult> resetPasswordWithBackend(
+    UserRole role,
+    String identifier,
+    String newPassword,
+  ) async {
+    try {
+      final response = await http
+          .patch(
+            Uri.parse('$kApiBaseUrl/api/auth/reset-password'),
+            headers: const {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'role': apiRoleFor(role),
+              'email': identifier.trim(),
+              'new_password': newPassword,
+            }),
+          )
+          .timeout(const Duration(seconds: 6));
+
+      if (response.statusCode == 404) {
+        return BackendAuthResult.invalidCredentials;
+      }
+      if (response.statusCode == 200) {
+        _backendOnline = true;
+        return BackendAuthResult.success;
+      }
+      return BackendAuthResult.unavailable;
+    } catch (_) {
+      _backendOnline = false;
+      return BackendAuthResult.unavailable;
+    }
+  }
+
+  /// Loads live FDR, institute and audit data from the backend and merges the
+  /// FDRs into the dashboards without discarding the offline seed records.
+  Future<void> fetchDashboardData() async {
+    try {
+      final response = await http
+          .get(Uri.parse('$kApiBaseUrl/api/dashboard-data'))
+          .timeout(const Duration(seconds: 6));
+      if (response.statusCode != 200) return;
+      final decoded = jsonDecode(response.body);
+      if (decoded is! Map) return;
+      final payload = decoded.cast<String, dynamic>();
+      if (payload['success'] != true) return;
+      _liveDashboardData = payload;
+      _mergeLiveFdrs(payload['fdrs']);
+      _backendOnline = true;
+      notifyListeners();
+    } catch (_) {
+      _backendOnline = false;
+    }
+  }
+
+  void _mergeLiveFdrs(dynamic rawFdrs) {
+    if (rawFdrs is! List) return;
+    for (final entry in rawFdrs) {
+      if (entry is! Map) continue;
+      final raw = entry.cast<String, dynamic>();
+      final id = raw['fdr_number']?.toString() ?? '';
+      if (id.isEmpty) continue;
+
+      final bank = _jsonMap(raw['bank_details']);
+      final financials = _jsonMap(raw['financials']);
+      final timeline = _jsonMap(raw['timeline']);
+      final issueDate = _apiDate(timeline['issue_date'], DateTime.now());
+      final maturityDate = _apiDate(timeline['maturity_date'], issueDate);
+      final penalty = _apiDouble(financials['penalty_deducted']);
+
+      final record = FDRRecord(
+        id: id,
+        bankName: bank['bank_name']?.toString() ?? 'Partner Bank',
+        ifsc: bank['ifsc_code']?.toString() ?? 'N/A',
+        instituteName: raw['institute_name']?.toString() ?? 'AICTE Institute',
+        instituteId: raw['aicte_permanent_id']?.toString() ?? kprId,
+        program: raw['program_type']?.toString() ?? 'AICTE Programme',
+        intake: _apiInt(raw['intake']),
+        amount: _apiDouble(financials['principal_amount']),
+        issueDate: issueDate,
+        maturityDate: maturityDate,
+        status: _statusFromApi(raw['lifecycle_status']?.toString()),
+        lastUpdated: DateTime.now(),
+        penalty: penalty,
+        deductedPenalty: penalty,
+        deficiency: timeline['is_time_exceeded'] == true,
+        remarks: 'Live MongoDB record.',
+      );
+
+      final index = records.indexWhere((item) => item.id == id);
+      if (index == -1) {
+        records.insert(0, record);
+      } else {
+        records[index] = record;
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Automated 90 / 60 / 30-day maturity notification gateway
+  // ---------------------------------------------------------------------------
+
+  int get notificationDispatchedToday {
+    final now = DateTime.now();
+    return notificationLogs
+        .where(
+          (log) =>
+              log.timestamp.year == now.year &&
+              log.timestamp.month == now.month &&
+              log.timestamp.day == now.day,
+        )
+        .length;
+  }
+
+  /// Fetches the live Email + SMS gateway ledger. When the API is unreachable
+  /// the locally derived demo ledger is retained so all dashboards keep
+  /// rendering meaningful government records.
+  Future<int> fetchNotificationLogs({bool notify = true}) async {
+    try {
+      final response = await http
+          .get(Uri.parse('$kApiBaseUrl/api/notifications/logs'))
+          .timeout(const Duration(seconds: 6));
+      if (response.statusCode != 200) return notificationLogs.length;
+      final decoded = jsonDecode(response.body);
+      if (decoded is! Map || decoded['success'] != true) {
+        return notificationLogs.length;
+      }
+      final payload = decoded.cast<String, dynamic>();
+      final rawLogs = payload['logs'];
+      if (rawLogs is List) {
+        notificationLogs
+          ..clear()
+          ..addAll(
+            rawLogs.whereType<Map>().map(
+              (entry) => MaturityNotificationLog.fromApi(
+                entry.cast<String, dynamic>(),
+              ),
+            ),
+          );
+      }
+      final counts = _jsonMap(payload['window_counts']);
+      if (counts.isNotEmpty) {
+        notificationWithin90 = _apiInt(counts['within_90_days']);
+        notificationWithin60 = _apiInt(counts['within_60_days']);
+        notificationWithin30 = _apiInt(counts['within_30_days']);
+      } else {
+        _refreshLocalNotificationCounts();
+      }
+      _backendOnline = true;
+      if (notify) notifyListeners();
+    } catch (_) {
+      _backendOnline = false;
+    }
+    return notificationLogs.length;
+  }
+
+  /// Invokes the Finance HQ manual scan. The backend force-dispatches a fresh
+  /// Email + SMS advisory for every qualifying FDR so evaluators can watch the
+  /// gateway ledger update in real time.
+  Future<int> runMaturityNotificationScan({bool silent = false}) async {
+    if (notificationScanBusy) return 0;
+    notificationScanBusy = true;
+    notificationGatewayStatus = 'SCANNING';
+    if (!silent) notifyListeners();
+    var dispatched = 0;
+    try {
+      final response = await http
+          .post(
+            Uri.parse('$kApiBaseUrl/api/notifications/run-scheduler'),
+            headers: const {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'force': true,
+              'triggered_by': 'FINANCE_HQ_MANUAL',
+            }),
+          )
+          .timeout(const Duration(seconds: 10));
+      if (response.statusCode == 200) {
+        final decoded = jsonDecode(response.body);
+        if (decoded is Map && decoded['success'] == true) {
+          final payload = decoded.cast<String, dynamic>();
+          dispatched = _apiInt(payload['dispatched_count']);
+          final counts = _jsonMap(payload['window_counts']);
+          notificationWithin90 = _apiInt(counts['within_90_days']);
+          notificationWithin60 = _apiInt(counts['within_60_days']);
+          notificationWithin30 = _apiInt(counts['within_30_days']);
+          await fetchNotificationLogs(notify: false);
+          _backendOnline = true;
+          _log(
+            title: 'Maturity alert scan executed',
+            detail:
+                'Finance HQ triggered the 90/60/30-day engine. $dispatched '
+                'Email + SMS advisory bundle${dispatched == 1 ? '' : 's'} '
+                'dispatched through the NIC-SMS / SMTP gateway.',
+            icon: Icons.campaign_rounded,
+            color: AppColors.indigo,
+          );
+        }
+      }
+    } catch (_) {
+      _backendOnline = false;
+    } finally {
+      notificationLastDispatchCount = dispatched;
+      notificationScanBusy = false;
+      notificationGatewayStatus = dispatched > 0 ? 'DISPATCHED' : 'STANDBY';
+      lastNotificationScan = DateTime.now();
+      notificationAutoChecked = true;
+      _refreshLocalNotificationCountsIfEmpty();
+      notifyListeners();
+    }
+    return dispatched;
+  }
+
+  /// Runs the automatic background check exactly once per signed-in session,
+  /// immediately after the Finance HQ workspace mounts.
+  Future<int> ensureAutomaticNotificationCheck() async {
+    if (notificationAutoChecked) return 0;
+    notificationAutoChecked = true;
+    return runMaturityNotificationScan(silent: true);
+  }
+
+  void _refreshLocalNotificationCountsIfEmpty() {
+    if (notificationWithin90 == 0 &&
+        notificationWithin60 == 0 &&
+        notificationWithin30 == 0) {
+      _refreshLocalNotificationCounts();
+    }
+  }
+
+  void _refreshLocalNotificationCounts() {
+    notificationWithin90 = 0;
+    notificationWithin60 = 0;
+    notificationWithin30 = 0;
+    for (final record in records) {
+      if (record.status.isClosed) continue;
+      final days = record.daysToMaturity;
+      if (days < 1) continue;
+      if (days <= 30) notificationWithin30 += 1;
+      if (days <= 60) notificationWithin60 += 1;
+      if (days <= 90) notificationWithin90 += 1;
+    }
+  }
+
+  String _notificationWindowForDays(int days) {
+    if (days <= 30) return '30_DAYS';
+    if (days <= 60) return '60_DAYS';
+    return '90_DAYS';
+  }
+
+  String _localAlertPreview(FDRRecord record, String window, int days) {
+    final title = switch (window) {
+      '30_DAYS' => '30-Day Critical Final Notice',
+      '60_DAYS' => '60-Day Follow-Up Reminder',
+      _ => '90-Day Pre-Maturity Advisory',
+    };
+    final action = switch (window) {
+      '30_DAYS' =>
+        'URGENT: Submit the Release Application or the renewed 2-year FDR immediately to avoid encashment and penalty action.',
+      '60_DAYS' =>
+        'Verify that the joint lien is still marked in favour of AICTE and confirm the release/renewal decision to the Regional Office.',
+      _ =>
+        'Please initiate the release or two-year renewal paperwork with the partner bank at least 30 days before maturity.',
+    };
+    final email = record.instituteId == kprId
+        ? 'principal@kpr.edu.in'
+        : 'principal@aicte-institute.edu.in';
+    const mobile = '+91-9840012310';
+    return 'EMAIL GATEWAY (SMTP)\nTo: $email\nCC: finance.hq@aicte.gov.in\n'
+        'Subject: AICTE e-Kosh | $title | FDR ${record.id}\n\n'
+        'Dear Principal / Nodal Officer,\n\n'
+        'This is an official ${title.toLowerCase()} issued by the AICTE Finance Bureau '
+        'for the Joint Fixed Deposit referenced below.\n\n'
+        'Institute: ${record.instituteName}\n'
+        'AICTE Permanent ID: ${record.instituteId}\n'
+        'FDR Number: ${record.id}\n'
+        'Bank / IFSC: ${record.bankName} / ${record.ifsc}\n'
+        'Principal Amount: ${inr(record.amount)}\n'
+        'Maturity Date: ${formatDate(record.maturityDate)} ($days days remaining)\n\n'
+        'Required action: $action\n\n'
+        'The release or renewal must be processed 100% digitally through the '
+        'e-Kosh portal. A copy of this advisory has been marked to '
+        'finance.hq@aicte.gov.in.\n\n'
+        'This is a system-generated message. Please do not reply.\n'
+        'AICTE Finance Bureau, New Delhi | Helpdesk 1800-11-2026\n\n'
+        'SMS GATEWAY (NIC-SMS)\nTo: $mobile\n\n'
+        'AICTE e-Kosh: FDR ${record.id} of ${record.instituteName} matures on '
+        '${formatDate(record.maturityDate)} ($days days). $action '
+        'Portal: https://ekosh.aicte.gov.in';
+  }
+
+  /// Seeds a local gateway ledger from the offline demo portfolio so the
+  /// Finance HQ engine is populated even when MongoDB is unreachable.
+  void _seedLocalNotificationLogs() {
+    final now = DateTime.now();
+    var sequence = 0;
+    for (final record in records) {
+      if (record.status.isClosed) continue;
+      final days = record.daysToMaturity;
+      if (days < 1 || days > 90) continue;
+      final window = _notificationWindowForDays(days);
+      notificationLogs.add(
+        MaturityNotificationLog(
+          fdrNumber: record.id,
+          aicteId: record.instituteId,
+          instituteName: record.instituteName,
+          recipientEmail: record.instituteId == kprId
+              ? 'principal@kpr.edu.in'
+              : 'principal@aicte-institute.edu.in',
+          recipientMobile: '+91-9840012310',
+          milestoneWindow: window,
+          channels: const ['EMAIL', 'SMS'],
+          messagePreview: _localAlertPreview(record, window, days),
+          deliveryStatus: 'DELIVERED',
+          triggeredBy: 'AUTO_CRON_SCHEDULER',
+          timestamp: now.subtract(Duration(minutes: 18 + sequence * 7)),
+          daysToMaturity: days,
+        ),
+      );
+      sequence += 1;
+    }
+    _refreshLocalNotificationCounts();
+  }
+
+  void signOut() {
+    if (!_authenticated) return;
+    _log(
+      title: 'Session signed out',
+      detail:
+          '${role.personName} closed the ${role.label} dashboard session. '
+          'All dashboard data remains anchored to the AICTE ledger.',
+      icon: Icons.logout_rounded,
+      color: AppColors.muted,
+    );
+    _authenticated = false;
+    _signedInUserId = null;
+    _currentUser = null;
     _navIndex = 0;
     notifyListeners();
+  }
+
+  /// Applies a password chosen through the OTP recovery flow. The override is
+  /// kept in memory for the current portal session and is used by signIn().
+  bool updatePassword(UserRole role, String newPassword) {
+    final trimmed = newPassword.trim();
+    if (trimmed.isEmpty) return false;
+    _passwordOverrides[role] = trimmed;
+    _log(
+      title: 'SSO password reset',
+      detail:
+          '${credentialFor(role).userId} completed OTP verification and '
+          'updated the AICTE SSO credential for the ${role.label} dashboard.',
+      icon: Icons.password_rounded,
+      color: AppColors.emeraldDark,
+    );
+    notifyListeners();
+    return true;
   }
 
   void selectNav(int index) {
@@ -829,6 +1531,17 @@ class PortalState extends ChangeNotifier {
     final days = record.daysToMaturity;
     return !record.status.isClosed && days >= 0 && days <= 30;
   }).toList();
+
+  /// FDRs inside the automated 90-day pre-maturity advisory horizon. The
+  /// Institute dashboard raises a high-priority banner for the nearest one.
+  List<FDRRecord> get preMaturityRecords => instituteRecords.where((record) {
+    if (record.status.isClosed) return false;
+    final days = record.daysToMaturity;
+    return days >= 1 && days <= 90;
+  }).toList()..sort((a, b) => a.daysToMaturity.compareTo(b.daysToMaturity));
+
+  FDRRecord? get nearestPreMaturityRecord =>
+      preMaturityRecords.isEmpty ? null : preMaturityRecords.first;
 
   List<FDRRecord> get maturityWatchlist => records
       .where((record) => !record.status.isClosed && record.isMatured)
@@ -1391,8 +2104,1966 @@ class _EKoshAppState extends State<EKoshApp> {
           applyPortalTextScale(context, child ?? const SizedBox.shrink()),
       home: AnimatedBuilder(
         animation: _state,
-        builder: (context, _) => PortalShell(state: _state),
+        builder: (context, _) => AnimatedSwitcher(
+          duration: const Duration(milliseconds: 320),
+          switchInCurve: Curves.easeOutCubic,
+          switchOutCurve: Curves.easeInCubic,
+          child: _state.isAuthenticated
+              ? PortalShell(key: const ValueKey('portal'), state: _state)
+              : PortalLoginPage(key: const ValueKey('login'), state: _state),
+        ),
       ),
+    );
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Secure sign-in gateway
+// -----------------------------------------------------------------------------
+
+// -----------------------------------------------------------------------------
+// GIGW / NIC-styled secure sign-in gateway
+// -----------------------------------------------------------------------------
+
+const Color _govSaffron = Color(0xFFFF9933);
+const Color _govGreen = Color(0xFF138808);
+const Color _govNavy = Color(0xFF1E3A8A);
+const Color _govInk = Color(0xFF0F172A);
+const Color _govGold = Color(0xFFD97706);
+const Color _govSlateBg = Color(0xFFF1F5F9);
+const Color _govLine = Color(0xFFCBD5E1);
+const Color _govAmberBg = Color(0xFFFEF3C7);
+const Color _govAmberLine = Color(0xFFFCD34D);
+const Color _govAmberInk = Color(0xFF92400E);
+
+/// Colour overrides applied by the accessibility "High Contrast" control.
+/// The palette only touches the sign-in surface so the rest of the portal
+/// keeps its normal design tokens.
+class _GovPalette {
+  const _GovPalette({required this.highContrast});
+
+  final bool highContrast;
+
+  Color get rightBackground => highContrast ? Colors.white : _govSlateBg;
+  Color get cardBorder => highContrast ? _govInk : _govLine;
+  double get cardBorderWidth => highContrast ? 2 : 1;
+  Color get muted => highContrast ? const Color(0xFF334155) : AppColors.muted;
+  Color get surface => highContrast ? Colors.white : const Color(0xFFF8FAFC);
+}
+
+class PortalLoginPage extends StatefulWidget {
+  const PortalLoginPage({super.key, required this.state});
+
+  final PortalState state;
+
+  @override
+  State<PortalLoginPage> createState() => _PortalLoginPageState();
+}
+
+class _PortalLoginPageState extends State<PortalLoginPage> {
+  static const _captchaAlphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  static const _captchaLength = 6;
+
+  final Random _captchaRandom = Random.secure();
+  final TextEditingController _userIdController = TextEditingController();
+  final TextEditingController _passwordController = TextEditingController();
+  final TextEditingController _captchaInputController = TextEditingController();
+  final FocusNode _userIdFocus = FocusNode();
+
+  UserRole _selected = UserRole.institute;
+  String _currentCaptchaCode = '';
+  int _captchaSeed = 0;
+  List<double> _captchaAngles = const <double>[];
+  bool _obscure = true;
+  bool _submitting = false;
+  bool _hindi = false;
+  bool _highContrast = false;
+  double _fontScale = kPortalTextScale;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _selected = widget.state.role;
+    _generateCaptcha();
+  }
+
+  @override
+  void dispose() {
+    _userIdController.dispose();
+    _passwordController.dispose();
+    _captchaInputController.dispose();
+    _userIdFocus.dispose();
+    super.dispose();
+  }
+
+  String _t(String english, String hindi) => _hindi ? hindi : english;
+
+  /// Draws a fresh six-character challenge, its per-character tilt and the
+  /// deterministic noise seed used by the captcha painter.
+  void _generateCaptcha() {
+    final buffer = StringBuffer();
+    for (var i = 0; i < _captchaLength; i++) {
+      buffer.write(
+        _captchaAlphabet[_captchaRandom.nextInt(_captchaAlphabet.length)],
+      );
+    }
+    _currentCaptchaCode = buffer.toString();
+    _captchaSeed = _captchaRandom.nextInt(1 << 31);
+    _captchaAngles = List<double>.generate(
+      _captchaLength,
+      (_) => (_captchaRandom.nextDouble() * 0.24) - 0.12,
+    );
+  }
+
+  String _tabLabel(UserRole role) => switch (role) {
+    UserRole.institute => 'Institute Login',
+    UserRole.bank => 'Bank Node',
+    UserRole.ro => 'AICTE RO',
+    UserRole.finance => 'Finance HQ',
+  };
+
+  String _userIdLabel(UserRole role) => switch (role) {
+    UserRole.institute => 'AICTE Permanent Institute ID / Official Email',
+    UserRole.bank => 'Bank CBS Node / IFSC Email',
+    UserRole.ro => 'AICTE Regional Office ID / Official Email',
+    UserRole.finance => 'AICTE Finance Bureau HQ ID / Official Email',
+  };
+
+  void _selectRole(UserRole role) {
+    if (role == _selected) return;
+    setState(() {
+      _selected = role;
+      _error = null;
+    });
+  }
+
+  void _refreshCaptcha() {
+    setState(() {
+      _generateCaptcha();
+      _captchaInputController.clear();
+      _error = null;
+    });
+  }
+
+  void _adjustFont(double delta) {
+    setState(() {
+      _fontScale = (_fontScale + delta).clamp(1.1, 1.9).toDouble();
+    });
+  }
+
+  void _resetFont() {
+    setState(() => _fontScale = kPortalTextScale);
+  }
+
+  void _toggleLanguage() {
+    setState(() => _hindi = !_hindi);
+  }
+
+  void _toggleContrast() {
+    setState(() => _highContrast = !_highContrast);
+  }
+
+  static const _captchaError =
+      'Verification Failed: Captcha does not match! Please try again.';
+
+  void _showCaptchaError() {
+    showAppToast(
+      context,
+      _captchaError,
+      icon: Icons.error_outline_rounded,
+      color: AppColors.red,
+    );
+  }
+
+  Future<void> _submit() async {
+    if (_submitting) return;
+    FocusScope.of(context).unfocus();
+    final enteredCaptcha = _captchaInputController.text.trim().toUpperCase();
+    if (enteredCaptcha.isEmpty ||
+        enteredCaptcha != _currentCaptchaCode.toUpperCase()) {
+      setState(() {
+        _error = _captchaError;
+        _generateCaptcha();
+        _captchaInputController.clear();
+      });
+      _showCaptchaError();
+      return;
+    }
+    setState(() {
+      _submitting = true;
+      _error = null;
+    });
+    await Future<void>.delayed(const Duration(milliseconds: 520));
+    if (!mounted) return;
+    final account = credentialFor(_selected);
+    final remote = await widget.state.signInWithBackend(
+      _selected,
+      _userIdController.text,
+      _passwordController.text,
+    );
+    if (!mounted) return;
+    final ok = switch (remote) {
+      BackendAuthResult.success => true,
+      BackendAuthResult.invalidCredentials => false,
+      BackendAuthResult.unavailable => widget.state.signIn(
+        _selected,
+        _userIdController.text,
+        _passwordController.text,
+      ),
+    };
+    if (!mounted) return;
+    setState(() {
+      _submitting = false;
+      if (!ok) {
+        _error =
+            'Invalid credentials for ${_selected.label}. Use the demo '
+            'credentials — user ID ${account.userId} or '
+            '${account.shortId}.';
+        _passwordController.clear();
+        _generateCaptcha();
+        _captchaInputController.clear();
+      }
+    });
+  }
+
+  Future<void> _openPasswordRecovery() async {
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => _PasswordRecoveryDialog(
+        state: widget.state,
+        initialIdentifier: _userIdController.text,
+        initialRole: _selected,
+        messengerContext: context,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = _GovPalette(highContrast: _highContrast);
+    return MediaQuery(
+      data: MediaQuery.of(
+        context,
+      ).copyWith(textScaler: TextScaler.linear(_fontScale)),
+      child: Scaffold(
+        backgroundColor: palette.rightBackground,
+        body: LayoutBuilder(
+          builder: (context, constraints) {
+            final width = constraints.maxWidth;
+            return Column(
+              children: [
+                _GovAccessibilityStrip(
+                  hindi: _hindi,
+                  highContrast: _highContrast,
+                  onSkip: _userIdFocus.requestFocus,
+                  onDecreaseFont: () => _adjustFont(-0.1),
+                  onResetFont: _resetFont,
+                  onIncreaseFont: () => _adjustFont(0.1),
+                  onToggleContrast: _toggleContrast,
+                  onToggleLanguage: _toggleLanguage,
+                ),
+                _GovMasthead(showBadges: width >= 1150),
+                const _GovTicker(),
+                Expanded(child: _buildCenteredCard(palette)),
+                _GovFooter(compact: width < 760),
+              ],
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCenteredCard(_GovPalette palette) {
+    return Container(
+      color: palette.rightBackground,
+      child: LayoutBuilder(
+        builder: (context, constraints) => SingleChildScrollView(
+          child: ConstrainedBox(
+            constraints: BoxConstraints(minHeight: constraints.maxHeight),
+            child: Center(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 24,
+                ),
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 500),
+                  child: _buildSsoCard(palette),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSsoCard(_GovPalette palette) {
+    final account = credentialFor(_selected);
+    return Container(
+      key: const Key('login-card'),
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: palette.cardBorder,
+          width: palette.cardBorderWidth,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: _govInk.withValues(alpha: 0.12),
+            blurRadius: 32,
+            offset: const Offset(0, 16),
+          ),
+        ],
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          SizedBox(
+            height: 4,
+            child: Column(
+              children: const [
+                SizedBox(height: 2, child: ColoredBox(color: _govNavy)),
+                Expanded(
+                  child: Row(
+                    children: [
+                      Expanded(child: ColoredBox(color: _govSaffron)),
+                      Expanded(child: ColoredBox(color: Colors.white)),
+                      Expanded(child: ColoredBox(color: _govGreen)),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(22, 20, 22, 8),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Container(
+                      width: 42,
+                      height: 42,
+                      decoration: BoxDecoration(
+                        gradient: const LinearGradient(
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                          colors: [_govNavy, _govInk],
+                        ),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: const Icon(
+                        Icons.lock_rounded,
+                        color: _govGold,
+                        size: 21,
+                      ),
+                    ),
+                    const SizedBox(width: 11),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            _t(
+                              'Single Sign-On (SSO) Stakeholder Authentication',
+                              'सिंगल साइन-ऑन (SSO) हितधारक प्रमाणीकरण',
+                            ),
+                            maxLines: 3,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontSize: 15,
+                              fontWeight: FontWeight.w900,
+                              letterSpacing: -0.2,
+                              height: 1.16,
+                              color: _govInk,
+                            ),
+                          ),
+                          const SizedBox(height: 3),
+                          Text(
+                            _t(
+                              'NIC Parichay-compatible • Role-scoped access',
+                              'NIC परिचय-संगत • भूमिका-आधारित पहुँच',
+                            ),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 8.4,
+                              height: 1.3,
+                              fontWeight: FontWeight.w600,
+                              color: palette.muted,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                Row(
+                  children: [
+                    for (var i = 0; i < UserRole.values.length; i++) ...[
+                      if (i > 0) const SizedBox(width: 4),
+                      Expanded(
+                        child: _GovRoleTab(
+                          key: Key('login-tab-${UserRole.values[i].name}'),
+                          label: _tabLabel(UserRole.values[i]),
+                          selected: UserRole.values[i] == _selected,
+                          onTap: () => _selectRole(UserRole.values[i]),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+                const SizedBox(height: 7),
+                Text(
+                  '${_selected.label} • ${_selected.org}',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 8.3,
+                    fontWeight: FontWeight.w600,
+                    color: palette.muted,
+                  ),
+                ),
+                const SizedBox(height: 13),
+                _GovFieldLabel(
+                  text: _userIdLabel(_selected),
+                  color: palette.muted,
+                ),
+                const SizedBox(height: 5),
+                TextFormField(
+                  key: const Key('login-user-id'),
+                  controller: _userIdController,
+                  focusNode: _userIdFocus,
+                  autofillHints: const [AutofillHints.username],
+                  textInputAction: TextInputAction.next,
+                  onFieldSubmitted: (_) => _submit(),
+                  style: const TextStyle(
+                    fontSize: 10.8,
+                    fontWeight: FontWeight.w600,
+                    color: _govInk,
+                  ),
+                  decoration: InputDecoration(
+                    hintText: account.userId,
+                    hintStyle: TextStyle(
+                      fontSize: 10,
+                      fontWeight: FontWeight.w400,
+                      color: palette.muted.withValues(alpha: 0.8),
+                    ),
+                    prefixIcon: Icon(_selected.icon, size: 17, color: _govNavy),
+                    prefixIconConstraints: const BoxConstraints(
+                      minWidth: 38,
+                      minHeight: 38,
+                    ),
+                    isDense: true,
+                    filled: true,
+                    fillColor: Colors.white,
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 13,
+                    ),
+                    border: _govFieldBorder(_govLine),
+                    enabledBorder: _govFieldBorder(_govLine),
+                    focusedBorder: _govFieldBorder(_govNavy, width: 1.4),
+                  ),
+                ),
+                const SizedBox(height: 11),
+                _GovFieldLabel(
+                  text: _t('Password', 'पासवर्ड'),
+                  color: palette.muted,
+                ),
+                const SizedBox(height: 5),
+                TextFormField(
+                  key: const Key('login-password'),
+                  controller: _passwordController,
+                  obscureText: _obscure,
+                  autofillHints: const [AutofillHints.password],
+                  textInputAction: TextInputAction.done,
+                  onFieldSubmitted: (_) => _submit(),
+                  style: const TextStyle(
+                    fontSize: 10.8,
+                    fontWeight: FontWeight.w600,
+                    color: _govInk,
+                  ),
+                  decoration: InputDecoration(
+                    hintText: _t('Enter SSO password', 'SSO पासवर्ड दर्ज करें'),
+                    hintStyle: TextStyle(
+                      fontSize: 10,
+                      fontWeight: FontWeight.w400,
+                      color: palette.muted.withValues(alpha: 0.8),
+                    ),
+                    prefixIcon: const Icon(
+                      Icons.lock_outline_rounded,
+                      size: 17,
+                      color: _govNavy,
+                    ),
+                    prefixIconConstraints: const BoxConstraints(
+                      minWidth: 38,
+                      minHeight: 38,
+                    ),
+                    suffixIcon: IconButton(
+                      tooltip: _obscure ? 'Show password' : 'Hide password',
+                      onPressed: () => setState(() => _obscure = !_obscure),
+                      icon: Icon(
+                        _obscure
+                            ? Icons.visibility_off_outlined
+                            : Icons.visibility_outlined,
+                        size: 17,
+                        color: palette.muted,
+                      ),
+                    ),
+                    isDense: true,
+                    filled: true,
+                    fillColor: Colors.white,
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 13,
+                    ),
+                    border: _govFieldBorder(_govLine),
+                    enabledBorder: _govFieldBorder(_govLine),
+                    focusedBorder: _govFieldBorder(_govNavy, width: 1.4),
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: TextButton(
+                    key: const Key('forgot-password'),
+                    onPressed: _openPasswordRecovery,
+                    style: TextButton.styleFrom(
+                      foregroundColor: _govNavy,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 2,
+                        vertical: 0,
+                      ),
+                      minimumSize: const Size(0, 22),
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      textStyle: const TextStyle(
+                        fontSize: 8.6,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    child: const Text('Forgot Password?'),
+                  ),
+                ),
+                if (_error != null) ...[
+                  const SizedBox(height: 6),
+                  _GovErrorBanner(message: _error!),
+                ],
+                const SizedBox(height: 6),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(
+                      flex: 5,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          _GovFieldLabel(
+                            text: _t('Security Captcha', 'सुरक्षा कैप्चा'),
+                            color: palette.muted,
+                          ),
+                          const SizedBox(height: 5),
+                          Container(
+                            height: 48,
+                            clipBehavior: Clip.antiAlias,
+                            decoration: BoxDecoration(
+                              gradient: const LinearGradient(
+                                begin: Alignment.topLeft,
+                                end: Alignment.bottomRight,
+                                colors: [Color(0xFFEFF6FF), Color(0xFFDBEAFE)],
+                              ),
+                              borderRadius: BorderRadius.circular(6),
+                              border: Border.all(
+                                color: palette.cardBorder,
+                                width: palette.cardBorderWidth,
+                              ),
+                            ),
+                            child: Row(
+                              children: [
+                                Expanded(
+                                  child: Stack(
+                                    children: [
+                                      Positioned.fill(
+                                        child: CustomPaint(
+                                          painter: _CaptchaNoisePainter(
+                                            seed: _captchaSeed,
+                                            dotColor: _govNavy,
+                                            lineColor: _govNavy,
+                                          ),
+                                        ),
+                                      ),
+                                      Positioned.fill(
+                                        child: Padding(
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 9,
+                                          ),
+                                          child: FittedBox(
+                                            fit: BoxFit.scaleDown,
+                                            alignment: Alignment.centerLeft,
+                                            child: Row(
+                                              mainAxisSize: MainAxisSize.min,
+                                              children: [
+                                                for (
+                                                  var i = 0;
+                                                  i < _captchaLength;
+                                                  i++
+                                                )
+                                                  Transform.rotate(
+                                                    angle:
+                                                        _captchaAngles.length ==
+                                                            _captchaLength
+                                                        ? _captchaAngles[i]
+                                                        : 0,
+                                                    child: Text(
+                                                      _currentCaptchaCode[i],
+                                                      key: Key(
+                                                        'captcha-char-$i',
+                                                      ),
+                                                      textScaler:
+                                                          TextScaler.noScaling,
+                                                      style: const TextStyle(
+                                                        fontSize: 20,
+                                                        fontWeight:
+                                                            FontWeight.w900,
+                                                        letterSpacing: 3,
+                                                        color: Color(
+                                                          0xFF1E3A8A,
+                                                        ),
+                                                        fontFamily: 'monospace',
+                                                      ),
+                                                    ),
+                                                  ),
+                                              ],
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                Padding(
+                                  padding: const EdgeInsets.only(right: 2),
+                                  child: IconButton(
+                                    key: const Key('captcha-refresh'),
+                                    tooltip: 'Refresh captcha',
+                                    onPressed: _refreshCaptcha,
+                                    padding: EdgeInsets.zero,
+                                    constraints: const BoxConstraints.tightFor(
+                                      width: 32,
+                                      height: 32,
+                                    ),
+                                    icon: const Icon(
+                                      Icons.refresh,
+                                      size: 20,
+                                      color: Color(0xFF1E3A8A),
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      flex: 6,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          _GovFieldLabel(
+                            text: _t('Human Verification', 'मानव सत्यापन'),
+                            color: palette.muted,
+                          ),
+                          const SizedBox(height: 5),
+                          TextFormField(
+                            key: const Key('login-captcha'),
+                            controller: _captchaInputController,
+                            maxLength: 6,
+                            textCapitalization: TextCapitalization.characters,
+                            textInputAction: TextInputAction.done,
+                            onFieldSubmitted: (_) => _submit(),
+                            style: const TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w800,
+                              letterSpacing: 1.6,
+                              color: _govInk,
+                            ),
+                            decoration: InputDecoration(
+                              counterText: '',
+                              hintText: 'Enter Captcha',
+                              hintStyle: TextStyle(
+                                fontSize: 9.4,
+                                fontWeight: FontWeight.w400,
+                                color: palette.muted.withValues(alpha: 0.8),
+                              ),
+                              prefixIcon: const Icon(
+                                Icons.verified_user_outlined,
+                                size: 16,
+                                color: _govNavy,
+                              ),
+                              prefixIconConstraints: const BoxConstraints(
+                                minWidth: 34,
+                                minHeight: 38,
+                              ),
+                              isDense: true,
+                              filled: true,
+                              fillColor: Colors.white,
+                              contentPadding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 13,
+                              ),
+                              border: _govFieldBorder(_govLine),
+                              enabledBorder: _govFieldBorder(_govLine),
+                              focusedBorder: _govFieldBorder(
+                                _govNavy,
+                                width: 1.4,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 5),
+                Text(
+                  _t(
+                    'Case-insensitive human verification • refresh for a new code',
+                    'केस-असंवेदनशील मानव सत्यापन • नया कोड प्राप्त करें',
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 7.6,
+                    fontWeight: FontWeight.w500,
+                    color: palette.muted,
+                  ),
+                ),
+                const SizedBox(height: 14),
+                SizedBox(
+                  height: 46,
+                  child: FilledButton(
+                    key: const Key('login-submit'),
+                    onPressed: _submitting ? null : _submit,
+                    style: FilledButton.styleFrom(
+                      backgroundColor: _govNavy,
+                      foregroundColor: Colors.white,
+                      disabledBackgroundColor: _govNavy.withValues(alpha: 0.6),
+                      disabledForegroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                    ),
+                    child: _submitting
+                        ? const Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              SizedBox(
+                                width: 14,
+                                height: 14,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  color: Colors.white,
+                                ),
+                              ),
+                              SizedBox(width: 8),
+                              Flexible(
+                                child: Text(
+                                  'AUTHENTICATING…',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 10,
+                                    fontWeight: FontWeight.w800,
+                                    letterSpacing: 0.6,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          )
+                        : FittedBox(
+                            fit: BoxFit.scaleDown,
+                            child: Text(
+                              _t(
+                                'AUTHENTICATE & PROCEED TO PORTAL →',
+                                'प्रमाणित करें और पोर्टल पर जाएँ →',
+                              ),
+                              maxLines: 1,
+                              softWrap: false,
+                              style: const TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w900,
+                                letterSpacing: 0.5,
+                              ),
+                            ),
+                          ),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    const Icon(
+                      Icons.verified_user_outlined,
+                      size: 12,
+                      color: AppColors.emeraldDark,
+                    ),
+                    const SizedBox(width: 5),
+                    Expanded(
+                      child: Text(
+                        _t(
+                          'Protected by TLS 1.3 • AICTE SSO • RBAC enforced',
+                          'TLS 1.3 द्वारा सुरक्षित • AICTE SSO • RBAC लागू',
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 7.7,
+                          fontWeight: FontWeight.w600,
+                          color: palette.muted,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  OutlineInputBorder _govFieldBorder(Color color, {double width = 1}) {
+    return OutlineInputBorder(
+      borderRadius: BorderRadius.circular(6),
+      borderSide: BorderSide(color: color, width: width),
+    );
+  }
+}
+
+/// Government-styled 3-step SSO password recovery dialog: request OTP, verify
+/// OTP, then set a new password. The dialog owns its text controllers so they
+/// are disposed only after the route is fully removed from the tree.
+class _PasswordRecoveryDialog extends StatefulWidget {
+  const _PasswordRecoveryDialog({
+    required this.state,
+    required this.initialIdentifier,
+    required this.initialRole,
+    required this.messengerContext,
+  });
+
+  final PortalState state;
+  final String initialIdentifier;
+  final UserRole initialRole;
+  final BuildContext messengerContext;
+
+  @override
+  State<_PasswordRecoveryDialog> createState() =>
+      _PasswordRecoveryDialogState();
+}
+
+class _PasswordRecoveryDialogState extends State<_PasswordRecoveryDialog> {
+  late final TextEditingController _identifierController =
+      TextEditingController(text: widget.initialIdentifier);
+  final TextEditingController _otpController = TextEditingController();
+  final TextEditingController _newPasswordController = TextEditingController();
+  final TextEditingController _confirmPasswordController =
+      TextEditingController();
+
+  int _step = 0;
+  bool _busy = false;
+  String? _error;
+  String _sentTo = '';
+  late UserRole _targetRole = widget.initialRole;
+
+  @override
+  void dispose() {
+    _identifierController.dispose();
+    _otpController.dispose();
+    _newPasswordController.dispose();
+    _confirmPasswordController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _sendOtp(StateSetter setDialogState) async {
+    final identifier = _identifierController.text.trim();
+    if (identifier.isEmpty) {
+      setDialogState(() {
+        _error = 'Enter your registered Official Email, AICTE ID or IFSC Code.';
+      });
+      return;
+    }
+    setDialogState(() {
+      _busy = true;
+      _error = null;
+    });
+    await Future<void>.delayed(const Duration(milliseconds: 420));
+    if (!mounted) return;
+    _targetRole = widget.initialRole;
+    for (final role in UserRole.values) {
+      final account = credentialFor(role);
+      final needle = identifier.toLowerCase();
+      if (needle == account.userId.toLowerCase() ||
+          needle == account.shortId.toLowerCase()) {
+        _targetRole = role;
+        break;
+      }
+    }
+    setDialogState(() {
+      _busy = false;
+      _sentTo = identifier;
+      _step = 1;
+    });
+  }
+
+  void _verifyOtp(StateSetter setDialogState) {
+    if (_otpController.text.trim() != _demoOtp) {
+      setDialogState(() {
+        _error = 'Invalid OTP. Enter the 6-digit demo OTP $_demoOtp and retry.';
+      });
+      return;
+    }
+    setDialogState(() {
+      _error = null;
+      _step = 2;
+    });
+  }
+
+  Future<void> _updatePassword() async {
+    if (_busy) return;
+    final password = _newPasswordController.text;
+    if (password.trim().length < 6) {
+      setState(() {
+        _error = 'New password must be at least 6 characters long.';
+      });
+      return;
+    }
+    if (password != _confirmPasswordController.text) {
+      setState(() {
+        _error = 'New password and confirmation do not match.';
+      });
+      return;
+    }
+
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    final result = await widget.state.resetPasswordWithBackend(
+      _targetRole,
+      _sentTo,
+      password,
+    );
+    if (!mounted) return;
+    if (result == BackendAuthResult.invalidCredentials) {
+      setState(() {
+        _busy = false;
+        _error =
+            'No matching AICTE SSO account was found for the selected role.';
+      });
+      return;
+    }
+
+    // Persisted in MongoDB when the API is reachable; the local override keeps
+    // the offline demo session usable either way.
+    widget.state.updatePassword(_targetRole, password);
+    if (!mounted) return;
+    final toastContext = widget.messengerContext;
+    Navigator.of(context).pop();
+    if (toastContext.mounted) {
+      showAppToast(
+        toastContext,
+        'Password updated successfully! Please sign in with your new '
+        'credentials.',
+        icon: Icons.check_circle_rounded,
+        color: AppColors.emeraldDark,
+      );
+    }
+  }
+
+  Widget _stepChip(int index, String label) {
+    final done = _step > index;
+    final active = _step == index;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: done
+            ? AppColors.emeraldDark
+            : active
+            ? _govNavy
+            : const Color(0xFFF1F5F9),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(
+          color: done || active ? Colors.transparent : _govLine,
+        ),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            done ? Icons.check_rounded : Icons.circle,
+            size: 9,
+            color: done || active ? Colors.white : AppColors.muted,
+          ),
+          const SizedBox(width: 4),
+          Text(
+            '${index + 1}. $label',
+            maxLines: 1,
+            style: TextStyle(
+              fontSize: 7.6,
+              fontWeight: FontWeight.w800,
+              color: done || active ? Colors.white : AppColors.muted,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  InputDecoration _fieldDecoration(String hint) {
+    return InputDecoration(
+      hintText: hint,
+      hintMaxLines: 1,
+      hintStyle: TextStyle(
+        fontSize: 9.5,
+        color: AppColors.muted.withValues(alpha: 0.85),
+      ),
+      isDense: true,
+      filled: true,
+      fillColor: const Color(0xFFF8FAFC),
+      contentPadding: const EdgeInsets.symmetric(horizontal: 11, vertical: 12),
+      border: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(6),
+        borderSide: const BorderSide(color: _govLine),
+      ),
+      enabledBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(6),
+        borderSide: const BorderSide(color: _govLine),
+      ),
+      focusedBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(6),
+        borderSide: const BorderSide(color: _govNavy, width: 1.4),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return StatefulBuilder(
+      builder: (context, setDialogState) {
+        return AlertDialog(
+          title: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Container(
+                width: 34,
+                height: 34,
+                decoration: BoxDecoration(
+                  color: _govNavy,
+                  borderRadius: BorderRadius.circular(7),
+                ),
+                child: const Icon(
+                  Icons.lock_reset_rounded,
+                  color: _govGold,
+                  size: 18,
+                ),
+              ),
+              const SizedBox(width: 9),
+              const Expanded(
+                child: Text(
+                  'Official SSO Password Recovery — OTP Verification',
+                  style: TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w800,
+                    height: 1.25,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          content: SizedBox(
+            width: 430,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Wrap(
+                    spacing: 5,
+                    runSpacing: 5,
+                    children: [
+                      _stepChip(0, 'Request'),
+                      _stepChip(1, 'Verify'),
+                      _stepChip(2, 'Reset'),
+                    ],
+                  ),
+                  const SizedBox(height: 13),
+                  if (_step == 0) ...[
+                    const Text(
+                      'Enter the Official Email, AICTE ID or IFSC Code '
+                      'registered with your stakeholder account.',
+                      style: TextStyle(
+                        fontSize: 9,
+                        height: 1.45,
+                        color: AppColors.muted,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      key: const Key('forgot-identifier'),
+                      controller: _identifierController,
+                      textInputAction: TextInputAction.done,
+                      onSubmitted: (_) => _sendOtp(setDialogState),
+                      style: const TextStyle(
+                        fontSize: 10.5,
+                        fontWeight: FontWeight.w600,
+                      ),
+                      decoration: _fieldDecoration(
+                        'Official Email / AICTE ID / IFSC Code',
+                      ),
+                    ),
+                  ],
+                  if (_step == 1) ...[
+                    Container(
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFECFDF5),
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(color: const Color(0xFF6EE7B7)),
+                      ),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Icon(
+                            Icons.mark_email_read_rounded,
+                            size: 16,
+                            color: AppColors.emeraldDark,
+                          ),
+                          const SizedBox(width: 7),
+                          Expanded(
+                            child: Text(
+                              'A 6-digit OTP has been sent to your registered '
+                              'official email/mobile (Demo OTP: '
+                              '$_demoOtp).${_sentTo.isEmpty ? '' : '\nSent to: $_sentTo'}',
+                              style: const TextStyle(
+                                fontSize: 8.8,
+                                height: 1.45,
+                                fontWeight: FontWeight.w600,
+                                color: Color(0xFF065F46),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    TextField(
+                      key: const Key('forgot-otp'),
+                      controller: _otpController,
+                      keyboardType: TextInputType.number,
+                      maxLength: 6,
+                      textInputAction: TextInputAction.done,
+                      onSubmitted: (_) => _verifyOtp(setDialogState),
+                      style: const TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: 4,
+                      ),
+                      decoration: _fieldDecoration(
+                        'Enter 6-digit OTP',
+                      ).copyWith(counterText: ''),
+                    ),
+                    const SizedBox(height: 5),
+                    const Text(
+                      'Demo OTP: $_demoOtp',
+                      style: TextStyle(
+                        fontSize: 8,
+                        fontWeight: FontWeight.w700,
+                        color: _govAmberInk,
+                      ),
+                    ),
+                  ],
+                  if (_step == 2) ...[
+                    TextField(
+                      key: const Key('forgot-new-password'),
+                      controller: _newPasswordController,
+                      obscureText: true,
+                      style: const TextStyle(
+                        fontSize: 10.5,
+                        fontWeight: FontWeight.w600,
+                      ),
+                      decoration: _fieldDecoration('New Password'),
+                    ),
+                    const SizedBox(height: 9),
+                    TextField(
+                      key: const Key('forgot-confirm-password'),
+                      controller: _confirmPasswordController,
+                      obscureText: true,
+                      textInputAction: TextInputAction.done,
+                      onSubmitted: _busy ? null : (_) => _updatePassword(),
+                      style: const TextStyle(
+                        fontSize: 10.5,
+                        fontWeight: FontWeight.w600,
+                      ),
+                      decoration: _fieldDecoration('Confirm New Password'),
+                    ),
+                    const SizedBox(height: 5),
+                    const Text(
+                      'Minimum 6 characters. The password is updated against '
+                      'the AICTE SSO database.',
+                      style: TextStyle(
+                        fontSize: 8,
+                        height: 1.4,
+                        color: AppColors.muted,
+                      ),
+                    ),
+                  ],
+                  if (_error != null) ...[
+                    const SizedBox(height: 9),
+                    Text(
+                      _error!,
+                      style: const TextStyle(
+                        fontSize: 8.8,
+                        height: 1.4,
+                        fontWeight: FontWeight.w700,
+                        color: AppColors.red,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: _busy ? null : () => Navigator.of(context).pop(),
+              child: const Text('Cancel'),
+            ),
+            if (_step == 0)
+              FilledButton(
+                key: const Key('forgot-send-otp'),
+                onPressed: _busy ? null : () => _sendOtp(setDialogState),
+                child: _busy
+                    ? const SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.white,
+                        ),
+                      )
+                    : const Text('Send Verification OTP'),
+              ),
+            if (_step == 1)
+              FilledButton(
+                key: const Key('forgot-verify-otp'),
+                onPressed: () => _verifyOtp(setDialogState),
+                child: const Text('Verify OTP'),
+              ),
+            if (_step == 2)
+              FilledButton(
+                key: const Key('forgot-update-password'),
+                onPressed: _busy ? null : _updatePassword,
+                child: _busy
+                    ? const SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.white,
+                        ),
+                      )
+                    : const Text('Update Password'),
+              ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+/// Paints the captcha security texture: deterministic speckles plus two subtle
+/// crossing lines rendered behind the challenge characters.
+class _CaptchaNoisePainter extends CustomPainter {
+  const _CaptchaNoisePainter({
+    required this.seed,
+    required this.dotColor,
+    required this.lineColor,
+  });
+
+  final int seed;
+  final Color dotColor;
+  final Color lineColor;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (size.isEmpty) return;
+    final random = Random(seed);
+
+    final dotPaint = Paint()..color = dotColor.withValues(alpha: 0.22);
+    for (var i = 0; i < 34; i++) {
+      canvas.drawCircle(
+        Offset(
+          random.nextDouble() * size.width,
+          random.nextDouble() * size.height,
+        ),
+        0.6 + random.nextDouble() * 1.4,
+        dotPaint,
+      );
+    }
+
+    final linePaint = Paint()
+      ..color = lineColor.withValues(alpha: 0.18)
+      ..strokeWidth = 1
+      ..strokeCap = StrokeCap.round;
+
+    final firstStart = Offset(
+      0,
+      size.height * (0.25 + random.nextDouble() * 0.5),
+    );
+    final firstEnd = Offset(
+      size.width,
+      size.height * (0.25 + random.nextDouble() * 0.5),
+    );
+    final secondStart = Offset(
+      size.width * (0.1 + random.nextDouble() * 0.2),
+      size.height,
+    );
+    final secondEnd = Offset(size.width * (0.7 + random.nextDouble() * 0.2), 0);
+    canvas.drawLine(firstStart, firstEnd, linePaint);
+    canvas.drawLine(secondStart, secondEnd, linePaint);
+  }
+
+  @override
+  bool shouldRepaint(_CaptchaNoisePainter oldDelegate) =>
+      oldDelegate.seed != seed ||
+      oldDelegate.dotColor != dotColor ||
+      oldDelegate.lineColor != lineColor;
+}
+
+class _GovFieldLabel extends StatelessWidget {
+  const _GovFieldLabel({required this.text, required this.color});
+
+  final String text;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Text(
+      text,
+      maxLines: 2,
+      overflow: TextOverflow.ellipsis,
+      style: TextStyle(
+        fontSize: 8.4,
+        fontWeight: FontWeight.w800,
+        letterSpacing: 0.25,
+        height: 1.2,
+        color: color,
+      ),
+    );
+  }
+}
+
+class _GovRoleTab extends StatelessWidget {
+  const _GovRoleTab({
+    super.key,
+    required this.label,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(5),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 160),
+        height: 38,
+        alignment: Alignment.center,
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        decoration: BoxDecoration(
+          color: selected ? _govNavy : Colors.white,
+          borderRadius: BorderRadius.circular(5),
+          border: Border.all(
+            color: selected ? _govNavy : _govLine,
+            width: selected ? 1.4 : 1,
+          ),
+        ),
+        child: FittedBox(
+          fit: BoxFit.scaleDown,
+          child: Text(
+            label,
+            maxLines: 1,
+            softWrap: false,
+            style: TextStyle(
+              fontSize: 8.8,
+              fontWeight: FontWeight.w800,
+              letterSpacing: 0.15,
+              color: selected ? Colors.white : _govInk,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _GovErrorBanner extends StatelessWidget {
+  const _GovErrorBanner({required this.message});
+
+  final String message;
+
+  @override
+  Widget build(BuildContext context) {
+    return Semantics(
+      container: true,
+      liveRegion: true,
+      label: message,
+      excludeSemantics: true,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        decoration: BoxDecoration(
+          color: const Color(0xFFFEF2F2),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: const Color(0xFFFCA5A5)),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Icon(
+              Icons.error_outline_rounded,
+              size: 15,
+              color: AppColors.red,
+            ),
+            const SizedBox(width: 7),
+            Expanded(
+              child: Text(
+                message,
+                style: const TextStyle(
+                  fontSize: 8.6,
+                  height: 1.4,
+                  fontWeight: FontWeight.w600,
+                  color: Color(0xFF991B1B),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _GovAccessibilityStrip extends StatelessWidget {
+  const _GovAccessibilityStrip({
+    required this.hindi,
+    required this.highContrast,
+    required this.onSkip,
+    required this.onDecreaseFont,
+    required this.onResetFont,
+    required this.onIncreaseFont,
+    required this.onToggleContrast,
+    required this.onToggleLanguage,
+    this.onScreenReaderAccess,
+    this.showContrast = true,
+  });
+
+  final bool hindi;
+  final bool highContrast;
+  final VoidCallback onSkip;
+  final VoidCallback onDecreaseFont;
+  final VoidCallback onResetFont;
+  final VoidCallback onIncreaseFont;
+  final VoidCallback onToggleContrast;
+  final VoidCallback onToggleLanguage;
+  final VoidCallback? onScreenReaderAccess;
+  final bool showContrast;
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final width = constraints.maxWidth;
+        final showSkip = width >= 1180;
+        final showScreenReader = width >= 900;
+        final showContrastLabel = width >= 760;
+        final showLanguageLabel = width >= 1050;
+        final showFullBanner = width >= 760;
+        return Container(
+          height: 32,
+          color: _govInk,
+          padding: const EdgeInsets.symmetric(horizontal: 10),
+          child: Row(
+            children: [
+              SizedBox(
+                width: 26,
+                height: 10,
+                child: Row(
+                  children: const [
+                    Expanded(child: ColoredBox(color: _govSaffron)),
+                    Expanded(child: ColoredBox(color: Colors.white)),
+                    Expanded(child: ColoredBox(color: _govGreen)),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    showFullBanner
+                        ? 'भारत सरकार | GOVERNMENT OF INDIA — MINISTRY OF EDUCATION'
+                        : 'भारत सरकार | GOVERNMENT OF INDIA',
+                    maxLines: 1,
+                    softWrap: false,
+                    style: const TextStyle(
+                      fontSize: 8.2,
+                      fontWeight: FontWeight.w600,
+                      letterSpacing: 0.15,
+                      color: Color(0xFFE2E8F0),
+                    ),
+                  ),
+                ),
+              ),
+              if (showSkip)
+                _GovStripAction(
+                  key: const Key('skip-content'),
+                  label: 'Skip to Main Content',
+                  tooltip: 'Skip to main content',
+                  onTap: onSkip,
+                ),
+              if (showScreenReader)
+                _GovStripAction(
+                  key: const Key('screen-reader-access'),
+                  label: width >= 1250
+                      ? 'Screen Reader Access'
+                      : 'Screen Reader',
+                  icon: Icons.accessibility_new_rounded,
+                  tooltip: 'Screen Reader Access',
+                  onTap:
+                      onScreenReaderAccess ??
+                      () {
+                        showAppToast(
+                          context,
+                          'Screen Reader Access: GIGW 3.0 landmark navigation and '
+                          'ARIA labels are enabled throughout the portal.',
+                          icon: Icons.accessibility_new_rounded,
+                          color: AppColors.navy,
+                        );
+                      },
+                ),
+              _GovStripAction(
+                key: const Key('font-decrease'),
+                label: 'A-',
+                tooltip: 'Decrease font size',
+                onTap: onDecreaseFont,
+              ),
+              _GovStripAction(
+                key: const Key('font-reset'),
+                label: 'A',
+                tooltip: 'Reset font size',
+                onTap: onResetFont,
+              ),
+              _GovStripAction(
+                key: const Key('font-increase'),
+                label: 'A+',
+                tooltip: 'Increase font size',
+                onTap: onIncreaseFont,
+              ),
+              if (showContrast)
+                _GovStripAction(
+                  key: const Key('contrast-toggle'),
+                  label: showContrastLabel ? 'High Contrast' : '',
+                  icon: highContrast
+                      ? Icons.contrast_rounded
+                      : Icons.brightness_6_outlined,
+                  tooltip: 'High Contrast',
+                  onTap: onToggleContrast,
+                ),
+              _GovStripAction(
+                key: const Key('language-toggle'),
+                label: showLanguageLabel
+                    ? hindi
+                          ? 'हिन्दी / English'
+                          : 'English / हिन्दी'
+                    : 'EN',
+                icon: Icons.translate_rounded,
+                tooltip: 'English / हिन्दी',
+                onTap: onToggleLanguage,
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _GovStripAction extends StatelessWidget {
+  const _GovStripAction({
+    super.key,
+    required this.label,
+    required this.onTap,
+    required this.tooltip,
+    this.icon,
+  });
+
+  final String label;
+  final VoidCallback onTap;
+  final String tooltip;
+  final IconData? icon;
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: tooltip,
+      child: Semantics(
+        button: true,
+        label: tooltip,
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(3),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 5),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (icon != null) ...[
+                  Icon(icon, size: 11, color: const Color(0xFFCBD5E1)),
+                  if (label.isNotEmpty) const SizedBox(width: 4),
+                ],
+                if (label.isNotEmpty)
+                  Text(
+                    label,
+                    maxLines: 1,
+                    softWrap: false,
+                    style: const TextStyle(
+                      fontSize: 8,
+                      fontWeight: FontWeight.w600,
+                      color: Color(0xFFE2E8F0),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _GovMasthead extends StatelessWidget {
+  const _GovMasthead({required this.showBadges});
+
+  final bool showBadges;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: 76,
+      padding: const EdgeInsets.symmetric(horizontal: 18),
+      decoration: const BoxDecoration(
+        color: Colors.white,
+        border: Border(bottom: BorderSide(color: _govGold, width: 3)),
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 44,
+            height: 44,
+            decoration: BoxDecoration(
+              gradient: const LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [_govNavy, Color(0xFF132A66)],
+              ),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: _govGold.withValues(alpha: 0.6)),
+            ),
+            child: const Icon(
+              Icons.account_balance_rounded,
+              color: _govGold,
+              size: 24,
+            ),
+          ),
+          const SizedBox(width: 11),
+          Expanded(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    'ALL INDIA COUNCIL FOR TECHNICAL EDUCATION (AICTE)',
+                    maxLines: 1,
+                    softWrap: false,
+                    style: TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: 0.15,
+                      color: _govInk,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 3),
+                FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    'e-Kosh: National Security Deposit & Joint FDR Lifecycle Management System',
+                    maxLines: 1,
+                    softWrap: false,
+                    style: TextStyle(
+                      fontSize: 9.8,
+                      fontWeight: FontWeight.w600,
+                      color: AppColors.muted,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          if (showBadges) ...[
+            const SizedBox(width: 14),
+            SizedBox(
+              width: 228,
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: const [
+                  _GovBadge(
+                    icon: Icons.hub_rounded,
+                    label: 'G2G / G2B Integrated',
+                  ),
+                  SizedBox(height: 3),
+                  _GovBadge(
+                    icon: Icons.eco_rounded,
+                    label: 'e-Governance Initiative',
+                  ),
+                  SizedBox(height: 3),
+                  _GovBadge(
+                    icon: Icons.verified_rounded,
+                    label: 'APH 2024-27 Compliant',
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _GovBadge extends StatelessWidget {
+  const _GovBadge({required this.icon, required this.label});
+
+  final IconData icon;
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: 20,
+      width: 228,
+      padding: const EdgeInsets.symmetric(horizontal: 8),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF8FAFC),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: _govLine),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, size: 10, color: _govNavy),
+          const SizedBox(width: 4),
+          Expanded(
+            child: FittedBox(
+              fit: BoxFit.scaleDown,
+              alignment: Alignment.centerLeft,
+              child: Text(
+                label,
+                maxLines: 1,
+                softWrap: false,
+                style: const TextStyle(
+                  fontSize: 7.1,
+                  fontWeight: FontWeight.w700,
+                  color: _govInk,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _GovTicker extends StatelessWidget {
+  const _GovTicker({this.hindi = false});
+
+  final bool hindi;
+
+  @override
+  Widget build(BuildContext context) {
+    final message = hindi
+        ? '📢 अनिवार्य परिपत्र: AICTE वित्त ब्यूरो के निर्देशानुसार सभी संयुक्त FDR '
+              'जमा, बैंक लियन सत्यापन और परिपक्वता-पश्चात e-NOC रिलीज़ 100% डिजिटल '
+              'रूप से e-Kosh पोर्टल पर ही संसाधित किए जाएँ। 90/60/30 दिन की '
+              'स्वचालित ईमेल व SMS चेतावनी सक्रिय है।'
+        : '📢 Mandatory Advisory: As per AICTE Finance Bureau guidelines, all '
+              'Joint FDR submissions, Bank Lien markings, and post-maturity '
+              'e-NOC releases must be processed 100% digitally via the e-Kosh '
+              'portal. Automated 90/60/30-day Pre-Maturity Email & SMS alerts and '
+              'QR-verified e-NOC settlement are now live.';
+    return Container(
+      height: 34,
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      decoration: const BoxDecoration(
+        color: _govAmberBg,
+        border: Border(bottom: BorderSide(color: _govAmberLine)),
+      ),
+      child: Row(
+        children: [
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+            decoration: BoxDecoration(
+              color: AppColors.red,
+              borderRadius: BorderRadius.circular(3),
+            ),
+            child: Text(
+              hindi ? 'नवीनतम परिपत्र' : 'LATEST CIRCULAR',
+              maxLines: 1,
+              softWrap: false,
+              style: const TextStyle(
+                fontSize: 7.2,
+                fontWeight: FontWeight.w900,
+                letterSpacing: 0.5,
+                color: Colors.white,
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              message,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                fontSize: 9,
+                fontWeight: FontWeight.w600,
+                color: _govAmberInk,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _GovFooter extends StatelessWidget {
+  const _GovFooter({required this.compact});
+
+  final bool compact;
+
+  static const _copyright =
+      '© 2026 All India Council for Technical Education (AICTE), Ministry of '
+      'Education, Govt. of India | NIC-SMS & SMTP Gateway Integrated | '
+      'SHA-256 Audited';
+  static const _credits =
+      'GIGW 3.0 Compliant | Helpdesk: 1800-11-2026 | New Delhi';
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: 40,
+      color: _govInk,
+      padding: const EdgeInsets.symmetric(horizontal: 14),
+      child: compact
+          ? Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    _copyright,
+                    maxLines: 1,
+                    softWrap: false,
+                    style: const TextStyle(
+                      fontSize: 7.4,
+                      fontWeight: FontWeight.w500,
+                      color: Color(0xFFCBD5E1),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 2),
+                FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    _credits,
+                    maxLines: 1,
+                    softWrap: false,
+                    style: const TextStyle(
+                      fontSize: 7.4,
+                      fontWeight: FontWeight.w500,
+                      color: Color(0xFF94A3B8),
+                    ),
+                  ),
+                ),
+              ],
+            )
+          : Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    _copyright,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 7.8,
+                      fontWeight: FontWeight.w500,
+                      color: Color(0xFFCBD5E1),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 16),
+                Expanded(
+                  child: Text(
+                    _credits,
+                    textAlign: TextAlign.right,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 7.8,
+                      fontWeight: FontWeight.w500,
+                      color: Color(0xFF94A3B8),
+                    ),
+                  ),
+                ),
+              ],
+            ),
     );
   }
 }
@@ -1500,60 +4171,388 @@ ThemeData _buildTheme() {
   );
 }
 
-class PortalShell extends StatelessWidget {
+class PortalShell extends StatefulWidget {
   const PortalShell({super.key, required this.state});
 
   final PortalState state;
 
   @override
+  State<PortalShell> createState() => _PortalShellState();
+}
+
+class _PortalShellState extends State<PortalShell> {
+  double _fontScale = kPortalTextScale;
+  bool _hindi = false;
+  final GlobalKey _mainContentKey = GlobalKey();
+
+  PortalState get state => widget.state;
+
+  void _adjustFont(double delta) {
+    setState(() {
+      _fontScale = (_fontScale + delta).clamp(1.1, 1.9).toDouble();
+    });
+  }
+
+  void _resetFont() {
+    setState(() => _fontScale = kPortalTextScale);
+  }
+
+  void _toggleLanguage() {
+    setState(() => _hindi = !_hindi);
+    showAppToast(
+      context,
+      _hindi
+          ? 'भाषा हिन्दी में बदली गई। सरकारी परिपत्र और सहायता पाठ द्विभाषी हैं।'
+          : 'Language switched to English. Official circulars retain bilingual labels.',
+      icon: Icons.translate_rounded,
+      color: AppColors.navy,
+    );
+  }
+
+  void _skipToMainContent() {
+    final contentContext = _mainContentKey.currentContext;
+    if (contentContext != null) {
+      Scrollable.ensureVisible(
+        contentContext,
+        duration: const Duration(milliseconds: 260),
+        curve: Curves.easeOut,
+        alignment: 0,
+      );
+    }
+    showAppToast(
+      context,
+      'Skipped to the main workspace content.',
+      icon: Icons.keyboard_tab_rounded,
+      color: AppColors.navy,
+    );
+  }
+
+  void _showScreenReaderAccess() {
+    showDialog<void>(
+      context: context,
+      barrierColor: AppColors.navyInk.withValues(alpha: 0.46),
+      builder: (dialogContext) => PortalDialogFrame(
+        title: 'Screen Reader & Accessibility Access',
+        icon: '♿',
+        eyebrow: 'GIGW 3.0 ACCESSIBILITY STATEMENT',
+        subtitle:
+            'This portal is compliant with WCAG 2.1 AA and the Government of '
+            'India GIGW 3.0 accessibility guidelines.',
+        maxWidth: 660,
+        body: const Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _ScreenReaderLine(
+              icon: Icons.keyboard_rounded,
+              text:
+                  'Use Tab / Shift+Tab to move between controls and Enter to '
+                  'activate the focused button or link.',
+            ),
+            _ScreenReaderLine(
+              icon: Icons.record_voice_over_rounded,
+              text:
+                  'All dashboards expose semantic headings, table captions and '
+                  'ARIA labels for JAWS, NVDA and TalkBack.',
+            ),
+            _ScreenReaderLine(
+              icon: Icons.format_size_rounded,
+              text:
+                  'Use A- / A / A+ in the top strip to resize text without '
+                  'losing layout or table readability.',
+            ),
+            _ScreenReaderLine(
+              icon: Icons.translate_rounded,
+              text:
+                  'The English / हिन्दी control switches official notices to '
+                  'bilingual mode.',
+            ),
+            _ScreenReaderLine(
+              icon: Icons.support_agent_rounded,
+              text:
+                  'Accessibility helpdesk: 1800-11-2026 (toll-free) or '
+                  'accessibility@aicte.gov.in.',
+            ),
+          ],
+        ),
+        actions: [
+          AppButton(
+            label: 'Close',
+            icon: Icons.close_rounded,
+            dense: true,
+            onPressed: () => Navigator.of(dialogContext).pop(),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      body: Stack(
-        children: [
-          Column(
-            children: [
-              PortalTopBar(state: state),
-              Expanded(
-                child: LayoutBuilder(
-                  builder: (context, constraints) {
-                    final collapsed = constraints.maxWidth < 1180;
-                    return Row(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        PortalSidebar(state: state, collapsed: collapsed),
-                        Expanded(
-                          child: Container(
-                            color: AppColors.slate,
-                            child: AnimatedSwitcher(
-                              duration: const Duration(milliseconds: 220),
-                              switchInCurve: Curves.easeOut,
-                              switchOutCurve: Curves.easeIn,
-                              transitionBuilder: (child, animation) {
-                                return FadeTransition(
-                                  opacity: animation,
-                                  child: child,
+    return MediaQuery(
+      data: MediaQuery.of(
+        context,
+      ).copyWith(textScaler: TextScaler.linear(_fontScale)),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final width = constraints.maxWidth;
+          return Scaffold(
+            body: Stack(
+              children: [
+                Column(
+                  children: [
+                    _GovAccessibilityStrip(
+                      hindi: _hindi,
+                      highContrast: false,
+                      showContrast: false,
+                      onSkip: _skipToMainContent,
+                      onScreenReaderAccess: _showScreenReaderAccess,
+                      onDecreaseFont: () => _adjustFont(-0.1),
+                      onResetFont: _resetFont,
+                      onIncreaseFont: () => _adjustFont(0.1),
+                      onToggleContrast: () {},
+                      onToggleLanguage: _toggleLanguage,
+                    ),
+                    PortalTopBar(state: state),
+                    _GovTicker(hindi: _hindi),
+                    Expanded(
+                      child: Column(
+                        children: [
+                          _GovBreadcrumbBar(state: state, hindi: _hindi),
+                          Expanded(
+                            child: LayoutBuilder(
+                              builder: (context, constraints) {
+                                final collapsed = constraints.maxWidth < 1180;
+                                return Row(
+                                  crossAxisAlignment:
+                                      CrossAxisAlignment.stretch,
+                                  children: [
+                                    PortalSidebar(
+                                      state: state,
+                                      collapsed: collapsed,
+                                    ),
+                                    Expanded(
+                                      child: Container(
+                                        key: _mainContentKey,
+                                        color: AppColors.slate,
+                                        child: AnimatedSwitcher(
+                                          duration: const Duration(
+                                            milliseconds: 220,
+                                          ),
+                                          switchInCurve: Curves.easeOut,
+                                          switchOutCurve: Curves.easeIn,
+                                          transitionBuilder:
+                                              (child, animation) {
+                                                return FadeTransition(
+                                                  opacity: animation,
+                                                  child: child,
+                                                );
+                                              },
+                                          child: KeyedSubtree(
+                                            key: ValueKey(
+                                              '${state.role.name}-${state.navIndex}',
+                                            ),
+                                            child: _pageForState(
+                                              context,
+                                              state,
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ],
                                 );
                               },
-                              child: KeyedSubtree(
-                                key: ValueKey(
-                                  '${state.role.name}-${state.navIndex}',
-                                ),
-                                child: _pageForState(context, state),
-                              ),
                             ),
                           ),
-                        ),
-                      ],
-                    );
-                  },
+                        ],
+                      ),
+                    ),
+                    _GovFooter(compact: width < 760),
+                  ],
+                ),
+                Positioned(
+                  right: 24,
+                  bottom: 24,
+                  child: SafeArea(child: AskEkoshAiFab(state: state)),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+/// Government breadcrumb strip with a live IST server clock. Displayed above
+/// the sidebar + workspace frame on every authenticated dashboard.
+class _GovBreadcrumbBar extends StatelessWidget {
+  const _GovBreadcrumbBar({required this.state, required this.hindi});
+
+  final PortalState state;
+  final bool hindi;
+
+  String get _portalLabel => switch (state.role) {
+    UserRole.institute => 'Institute Portal',
+    UserRole.bank => 'Bank Node Portal',
+    UserRole.ro => 'AICTE RO Portal',
+    UserRole.finance => 'Finance HQ Portal',
+  };
+
+  @override
+  Widget build(BuildContext context) {
+    final items = _navigationFor(state);
+    final module = state.navIndex < items.length
+        ? items[state.navIndex].label
+        : 'Dashboard';
+    final trail =
+        '${hindi ? 'होम' : 'Home'}  >  e-Kosh AICTE  >  $_portalLabel  >  $module';
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final showClock = constraints.maxWidth >= 760;
+        return Container(
+          height: 36,
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          decoration: const BoxDecoration(
+            color: Colors.white,
+            border: Border(bottom: BorderSide(color: _govLine)),
+          ),
+          child: Row(
+            children: [
+              const Icon(Icons.account_tree_rounded, size: 13, color: _govNavy),
+              const SizedBox(width: 7),
+              Expanded(
+                child: SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: Text(
+                    trail,
+                    maxLines: 1,
+                    style: const TextStyle(
+                      fontSize: 9.2,
+                      fontWeight: FontWeight.w600,
+                      color: Color(0xFF475569),
+                    ),
+                  ),
                 ),
               ),
+              if (showClock) ...[const SizedBox(width: 12), const _IstClock()],
             ],
           ),
-          Positioned(
-            right: 24,
-            bottom: 24,
-            child: SafeArea(child: AskEkoshAiFab(state: state)),
+        );
+      },
+    );
+  }
+}
+
+/// Live Indian Standard Time clock. Timers are skipped inside widget tests so
+/// `pumpAndSettle` can reach a stable frame while production runs tick every
+/// second.
+class _IstClock extends StatefulWidget {
+  const _IstClock();
+
+  @override
+  State<_IstClock> createState() => _IstClockState();
+}
+
+class _IstClockState extends State<_IstClock> {
+  Timer? _timer;
+  DateTime _ist = _nowIst();
+
+  static DateTime _nowIst() =>
+      DateTime.now().toUtc().add(const Duration(hours: 5, minutes: 30));
+
+  static bool get _isTestBinding {
+    var isTest = false;
+    assert(() {
+      isTest = WidgetsBinding.instance.runtimeType.toString().contains('Test');
+      return true;
+    }());
+    return isTest;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    if (_isTestBinding) return;
+    _timer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      setState(() => _ist = _nowIst());
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final time =
+        '${_two(_ist.hour)}:${_two(_ist.minute)}:${_two(_ist.second)} IST';
+    final date =
+        '${_two(_ist.day)} ${_monthsShort[_ist.month - 1]} ${_ist.year}';
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF1F5F9),
+        borderRadius: BorderRadius.circular(3),
+        border: Border.all(color: _govLine),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.schedule_rounded, size: 11, color: _govNavy),
+          const SizedBox(width: 4),
+          Text(
+            'IST SERVER TIME  •  $date  •  $time',
+            maxLines: 1,
+            style: const TextStyle(
+              fontSize: 8,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 0.2,
+              color: _govNavy,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ScreenReaderLine extends StatelessWidget {
+  const _ScreenReaderLine({required this.icon, required this.text});
+
+  final IconData icon;
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: 28,
+            height: 28,
+            decoration: BoxDecoration(
+              color: _govNavy.withValues(alpha: 0.07),
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(color: _govNavy.withValues(alpha: 0.14)),
+            ),
+            child: Icon(icon, size: 15, color: _govNavy),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              text,
+              style: const TextStyle(
+                fontSize: 11,
+                height: 1.5,
+                color: AppColors.ink,
+              ),
+            ),
           ),
         ],
       ),
@@ -1594,71 +4593,95 @@ class PortalTopBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      decoration: const BoxDecoration(
-        color: Colors.white,
-        border: Border(bottom: BorderSide(color: AppColors.border)),
-        boxShadow: [
-          BoxShadow(
-            color: Color(0x0F0F172A),
-            blurRadius: 20,
-            offset: Offset(0, 5),
-          ),
-        ],
-      ),
-      child: Column(
-        children: [
-          Container(
-            height: 3,
-            decoration: const BoxDecoration(
-              gradient: LinearGradient(
-                colors: [AppColors.gold, Color(0xFFF59E0B), AppColors.navy],
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final width = constraints.maxWidth;
+        final compact = width < 1120;
+        final ultraCompact = width < 560;
+        return Container(
+          decoration: const BoxDecoration(
+            color: Colors.white,
+            border: Border(bottom: BorderSide(color: AppColors.gold, width: 3)),
+            boxShadow: [
+              BoxShadow(
+                color: Color(0x0F0F172A),
+                blurRadius: 20,
+                offset: Offset(0, 5),
               ),
-            ),
+            ],
           ),
-          SizedBox(
-            height: 78,
-            child: LayoutBuilder(
-              builder: (context, constraints) {
-                final width = constraints.maxWidth;
-                final compact = width < 1120;
-                final veryCompact = width < 820;
-                final ultraCompact = width < 560;
-                return Padding(
-                  padding: EdgeInsets.symmetric(
-                    horizontal: ultraCompact ? 12 : 24,
-                  ),
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: Align(
-                          alignment: Alignment.centerLeft,
-                          child: _PortalBrand(
-                            showSubtitle: width >= 940,
-                            showWordmark: !ultraCompact,
+          child: SizedBox(
+            height: ultraCompact ? 124 : 76,
+            child: ultraCompact
+                ? _buildCompactBar()
+                : Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 24),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Align(
+                            alignment: Alignment.centerLeft,
+                            child: _PortalBrand(
+                              showSubtitle: width >= 940,
+                              showWordmark: true,
+                            ),
                           ),
                         ),
-                      ),
-                      if (width >= 1500) ...[
-                        const _LiveDemoPill(),
-                        const SizedBox(width: 14),
+                        if (width >= 1500) ...[
+                          const _LiveDemoPill(),
+                          const SizedBox(width: 14),
+                        ],
+                        _NotificationButton(state: state),
+                        if (width >= 860) ...[
+                          const SizedBox(width: 12),
+                          _CronButton(state: state),
+                        ],
+                        if (!compact) ...[
+                          const SizedBox(width: 12),
+                          _ActiveUserBadge(state: state),
+                        ],
+                        if (state.isAuthenticated) ...[
+                          const SizedBox(width: 12),
+                          _SignOutButton(
+                            state: state,
+                            showLabel: width >= 1180,
+                          ),
+                        ],
                       ],
-                      _NotificationButton(state: state),
-                      if (width >= 860) ...[
-                        const SizedBox(width: 12),
-                        _CronButton(state: state),
-                      ],
-                      if (!compact) ...[
-                        const SizedBox(width: 12),
-                        _ActiveUserBadge(state: state),
-                      ],
-                      const SizedBox(width: 12),
-                      _RoleSwitcher(state: state, compact: veryCompact),
-                    ],
+                    ),
                   ),
-                );
-              },
-            ),
+          ),
+        );
+      },
+    );
+  }
+
+  /// Ultra-narrow phones get a two-row bar so the sign-out control never
+  /// collides with the emblem and the notification bell.
+  Widget _buildCompactBar() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 4, 12, 6),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Row(
+            children: [
+              const Expanded(
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: _PortalBrand(showSubtitle: false, showWordmark: false),
+                ),
+              ),
+              _NotificationButton(state: state),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              const Spacer(),
+              if (state.isAuthenticated)
+                _SignOutButton(state: state, showLabel: false),
+            ],
           ),
         ],
       ),
@@ -1710,37 +4733,37 @@ class _PortalBrand extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const Text(
-                  'AICTE  •  GOVT OF INDIA',
+                  'GOVERNMENT OF INDIA  •  MINISTRY OF EDUCATION',
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
-                    fontSize: 8.5,
+                    fontSize: 8.2,
                     fontWeight: FontWeight.w800,
-                    letterSpacing: 1.25,
+                    letterSpacing: 1.05,
                     color: AppColors.gold,
                   ),
                 ),
                 const SizedBox(height: 2),
                 const Text(
-                  'e-Kosh AICTE',
+                  'ALL INDIA COUNCIL FOR TECHNICAL EDUCATION (AICTE)',
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
-                    fontSize: 21,
+                    fontSize: 14.6,
                     fontWeight: FontWeight.w900,
                     color: AppColors.navyInk,
-                    letterSpacing: -0.5,
-                    height: 1.0,
+                    letterSpacing: -0.1,
+                    height: 1.05,
                   ),
                 ),
                 if (showSubtitle) ...[
                   const SizedBox(height: 3),
                   const Text(
-                    'Security Deposit & FDR Lifecycle',
+                    'e-Kosh: National Security Deposit & Joint FDR Lifecycle Management System',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
-                      fontSize: 9.5,
+                      fontSize: 9.4,
                       color: AppColors.muted,
                       fontWeight: FontWeight.w500,
                     ),
@@ -1935,204 +4958,203 @@ class _ActiveUserBadge extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final role = state.role;
-    return Container(
-      height: 58,
-      padding: const EdgeInsets.fromLTRB(7, 5, 12, 5),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(13),
-        border: Border.all(color: AppColors.border),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Container(
-            width: 38,
-            height: 38,
-            decoration: BoxDecoration(
-              color: role.accent.withValues(alpha: 0.10),
-              shape: BoxShape.circle,
-              border: Border.all(color: role.accent.withValues(alpha: 0.18)),
-            ),
-            alignment: Alignment.center,
-            child: Text(
-              role.initials,
-              style: TextStyle(
-                color: role.accent,
-                fontSize: 12,
-                fontWeight: FontWeight.w900,
-              ),
-            ),
-          ),
-          const SizedBox(width: 9),
-          Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                role.personName,
-                style: const TextStyle(
-                  fontSize: 11.5,
-                  color: AppColors.navyInk,
-                  fontWeight: FontWeight.w800,
+    final email = state.signedInUserId;
+    return Tooltip(
+      message: email == null
+          ? '${role.personName} • ${role.label}'
+          : 'Signed in as $email • ${role.label}',
+      child: Container(
+        height: 62,
+        padding: const EdgeInsets.fromLTRB(7, 5, 12, 5),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(13),
+          border: Border.all(color: AppColors.border),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Stack(
+              clipBehavior: Clip.none,
+              children: [
+                Container(
+                  width: 38,
+                  height: 38,
+                  decoration: BoxDecoration(
+                    color: role.accent.withValues(alpha: 0.10),
+                    shape: BoxShape.circle,
+                    border: Border.all(
+                      color: role.accent.withValues(alpha: 0.18),
+                    ),
+                  ),
+                  alignment: Alignment.center,
+                  child: Text(
+                    role.initials,
+                    style: TextStyle(
+                      color: role.accent,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
                 ),
-              ),
-              Text(
-                role.shortLabel,
-                style: const TextStyle(
-                  fontSize: 9.5,
-                  color: AppColors.muted,
-                  fontWeight: FontWeight.w500,
+                Positioned(
+                  right: -1,
+                  bottom: -1,
+                  child: Container(
+                    width: 14,
+                    height: 14,
+                    decoration: BoxDecoration(
+                      color: AppColors.emeraldDark,
+                      shape: BoxShape.circle,
+                      border: Border.all(color: Colors.white, width: 2),
+                    ),
+                    child: const Icon(
+                      Icons.verified_user_rounded,
+                      size: 7,
+                      color: Colors.white,
+                    ),
+                  ),
                 ),
+              ],
+            ),
+            const SizedBox(width: 9),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 200),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    role.personName,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 11.5,
+                      height: 1.15,
+                      color: AppColors.navyInk,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                  Text(
+                    email ?? role.shortLabel,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 9.5,
+                      height: 1.15,
+                      color: AppColors.muted,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                  SizedBox(height: 1),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        Icons.verified_user_rounded,
+                        size: 8,
+                        color: AppColors.emeraldDark,
+                      ),
+                      SizedBox(width: 3),
+                      Text(
+                        'NIC SSO VERIFIED',
+                        style: TextStyle(
+                          fontSize: 7,
+                          height: 1.1,
+                          fontWeight: FontWeight.w900,
+                          letterSpacing: 0.45,
+                          color: AppColors.emeraldDark,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
               ),
-            ],
-          ),
-        ],
+            ),
+          ],
+        ),
       ),
     );
   }
 }
 
-class _RoleSwitcher extends StatelessWidget {
-  const _RoleSwitcher({required this.state, required this.compact});
+/// Logout control for the authenticated session. Clears the session and
+/// returns to the government SSO gateway so a different account can sign in.
+class _SignOutButton extends StatelessWidget {
+  const _SignOutButton({required this.state, required this.showLabel});
 
   final PortalState state;
-  final bool compact;
+  final bool showLabel;
+
+  Future<void> _confirm(BuildContext context) async {
+    final confirmed = await showConfirmDialog(
+      context,
+      title: 'Log out of e-Kosh AICTE?',
+      message:
+          'Your ${state.role.label} session for ${state.signedInUserId ?? state.credential.userId} '
+          'will be closed and you will return to the AICTE SSO gateway to '
+          'switch accounts. The credentials issued to this persona will be '
+          'required to sign back in.',
+      confirmLabel: 'Sign Out',
+      confirmColor: AppColors.red,
+      icon: Icons.logout_rounded,
+      extra: _DialogAmountBox(
+        label: 'Signed-in account',
+        value: state.signedInUserId ?? state.credential.userId,
+        helper: '${state.role.label} • ${state.role.location}',
+      ),
+    );
+    if (!confirmed || !context.mounted) return;
+    state.signOut();
+    showAppToast(
+      context,
+      'Session closed securely. AICTE SSO sign-in is required to reopen a dashboard.',
+      icon: Icons.lock_rounded,
+      color: AppColors.navy,
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      height: 58,
-      padding: EdgeInsets.fromLTRB(compact ? 10 : 12, 5, 8, 5),
-      decoration: BoxDecoration(
-        color: AppColors.cream,
+    return Tooltip(
+      message: 'Logout / Switch Account',
+      child: Material(
+        color: AppColors.red.withValues(alpha: 0.05),
         borderRadius: BorderRadius.circular(13),
-        border: Border.all(
-          color: AppColors.gold.withValues(alpha: 0.55),
-          width: 1.4,
-        ),
-        boxShadow: [
-          BoxShadow(
-            color: AppColors.gold.withValues(alpha: 0.08),
-            blurRadius: 14,
-            offset: const Offset(0, 5),
-          ),
-        ],
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Container(
-            width: 30,
-            height: 30,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(13),
+          onTap: () => _confirm(context),
+          child: Container(
+            height: 58,
+            padding: EdgeInsets.symmetric(horizontal: showLabel ? 13 : 12),
             decoration: BoxDecoration(
-              color: AppColors.gold.withValues(alpha: 0.13),
-              borderRadius: BorderRadius.circular(8),
+              borderRadius: BorderRadius.circular(13),
+              border: Border.all(color: AppColors.red.withValues(alpha: 0.28)),
             ),
-            child: const Icon(
-              Icons.swap_horiz_rounded,
-              color: AppColors.gold,
-              size: 19,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(
+                  Icons.logout_rounded,
+                  size: 17,
+                  color: AppColors.red,
+                ),
+                if (showLabel) ...[
+                  const SizedBox(width: 7),
+                  const Text(
+                    'LOGOUT / SWITCH ACCOUNT',
+                    style: TextStyle(
+                      fontSize: 7.8,
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: 0.4,
+                      color: AppColors.red,
+                    ),
+                  ),
+                ],
+              ],
             ),
           ),
-          const SizedBox(width: 9),
-          Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              if (!compact)
-                const Text(
-                  'SWITCH DEMO ROLE',
-                  style: TextStyle(
-                    fontSize: 7.5,
-                    letterSpacing: 0.9,
-                    fontWeight: FontWeight.w900,
-                    color: AppColors.gold,
-                  ),
-                ),
-              if (!compact) const SizedBox(height: 1),
-              DropdownButtonHideUnderline(
-                child: DropdownButton<UserRole>(
-                  value: state.role,
-                  isDense: true,
-                  isExpanded: false,
-                  borderRadius: BorderRadius.circular(12),
-                  dropdownColor: Colors.white,
-                  itemHeight: 52,
-                  icon: const Icon(
-                    Icons.keyboard_arrow_down_rounded,
-                    color: AppColors.gold,
-                    size: 19,
-                  ),
-                  style: const TextStyle(
-                    color: AppColors.navyInk,
-                    fontSize: 11.5,
-                    fontWeight: FontWeight.w800,
-                  ),
-                  selectedItemBuilder: (context) {
-                    return UserRole.values
-                        .map(
-                          (role) => Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(role.icon, size: 15, color: role.accent),
-                              const SizedBox(width: 6),
-                              Text(
-                                role.shortLabel,
-                                style: const TextStyle(
-                                  color: AppColors.navyInk,
-                                  fontSize: 11.5,
-                                  fontWeight: FontWeight.w800,
-                                ),
-                              ),
-                            ],
-                          ),
-                        )
-                        .toList();
-                  },
-                  items: UserRole.values
-                      .map(
-                        (role) => DropdownMenuItem<UserRole>(
-                          value: role,
-                          child: Row(
-                            children: [
-                              Icon(role.icon, size: 17, color: role.accent),
-                              const SizedBox(width: 9),
-                              Column(
-                                mainAxisSize: MainAxisSize.min,
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text(
-                                    role.shortLabel,
-                                    style: const TextStyle(
-                                      fontSize: 11.5,
-                                      fontWeight: FontWeight.w700,
-                                      color: AppColors.navyInk,
-                                    ),
-                                  ),
-                                  Text(
-                                    role.location,
-                                    style: const TextStyle(
-                                      fontSize: 9,
-                                      color: AppColors.muted,
-                                      fontWeight: FontWeight.w400,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ],
-                          ),
-                        ),
-                      )
-                      .toList(),
-                  onChanged: (role) {
-                    if (role != null) state.switchRole(role);
-                  },
-                ),
-              ),
-            ],
-          ),
-        ],
+        ),
       ),
     );
   }
@@ -2282,10 +5304,7 @@ class _SidebarTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final tile = Padding(
-      padding: EdgeInsets.symmetric(
-        horizontal: collapsed ? 12 : 14,
-        vertical: 3,
-      ),
+      padding: const EdgeInsets.symmetric(vertical: 3),
       child: Material(
         color: Colors.transparent,
         child: InkWell(
@@ -2294,7 +5313,6 @@ class _SidebarTile extends StatelessWidget {
           child: AnimatedContainer(
             duration: const Duration(milliseconds: 170),
             height: 48,
-            padding: EdgeInsets.symmetric(horizontal: collapsed ? 0 : 12),
             decoration: BoxDecoration(
               color: selected
                   ? Colors.white.withValues(alpha: 0.11)
@@ -2306,88 +5324,104 @@ class _SidebarTile extends StatelessWidget {
                     : Colors.transparent,
               ),
             ),
-            child: Row(
-              mainAxisAlignment: collapsed
-                  ? MainAxisAlignment.center
-                  : MainAxisAlignment.start,
+            child: Stack(
               children: [
-                if (selected && !collapsed) ...[
-                  Container(
-                    width: 3,
-                    height: 19,
-                    decoration: BoxDecoration(
-                      color: AppColors.gold,
-                      borderRadius: BorderRadius.circular(4),
-                    ),
-                  ),
-                  const SizedBox(width: 11),
-                ],
-                Icon(
-                  item.icon,
-                  size: 20,
-                  color: selected
-                      ? AppColors.gold
-                      : Colors.white.withValues(alpha: 0.68),
-                ),
-                if (!collapsed) ...[
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Text(
-                      item.label,
-                      style: TextStyle(
-                        fontSize: 11.8,
-                        fontWeight: selected
-                            ? FontWeight.w800
-                            : FontWeight.w500,
-                        color: selected
-                            ? Colors.white
-                            : Colors.white.withValues(alpha: 0.72),
-                      ),
-                    ),
-                  ),
-                  if (item.badge != null && item.badge! > 0)
-                    Container(
-                      constraints: const BoxConstraints(minWidth: 20),
-                      height: 20,
-                      padding: const EdgeInsets.symmetric(horizontal: 5),
-                      decoration: BoxDecoration(
-                        color: selected ? AppColors.gold : Colors.white,
-                        borderRadius: BorderRadius.circular(999),
-                      ),
-                      alignment: Alignment.center,
-                      child: Text(
-                        '${item.badge}',
-                        style: TextStyle(
-                          color: selected
-                              ? AppColors.navyInk
-                              : AppColors.navyDeep,
-                          fontSize: 9.5,
-                          fontWeight: FontWeight.w900,
+                if (selected)
+                  Positioned(
+                    left: 0,
+                    top: 0,
+                    bottom: 0,
+                    child: Container(
+                      width: 4,
+                      decoration: const BoxDecoration(
+                        color: Color(0xFFF59E0B),
+                        borderRadius: BorderRadius.horizontal(
+                          left: Radius.circular(11),
                         ),
                       ),
                     ),
-                ],
-                if (collapsed && item.badge != null && item.badge! > 0) ...[
-                  const SizedBox(width: 3),
-                  Container(
-                    constraints: const BoxConstraints(minWidth: 14),
-                    height: 14,
-                    padding: const EdgeInsets.symmetric(horizontal: 3),
-                    decoration: BoxDecoration(
-                      color: AppColors.gold,
-                      borderRadius: BorderRadius.circular(999),
-                    ),
-                    alignment: Alignment.center,
-                    child: Text(
-                      '${item.badge}',
-                      style: const TextStyle(
-                        color: AppColors.navyInk,
-                        fontSize: 7.5,
-                        fontWeight: FontWeight.w900,
-                      ),
-                    ),
                   ),
-                ],
+                Padding(
+                  padding: EdgeInsets.only(
+                    left: collapsed ? 0 : 16,
+                    right: collapsed ? 0 : 12,
+                  ),
+                  child: Row(
+                    mainAxisAlignment: collapsed
+                        ? MainAxisAlignment.center
+                        : MainAxisAlignment.start,
+                    children: [
+                      Icon(
+                        item.icon,
+                        size: 20,
+                        color: selected
+                            ? AppColors.gold
+                            : Colors.white.withValues(alpha: 0.68),
+                      ),
+                      if (!collapsed) ...[
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            item.label,
+                            style: TextStyle(
+                              fontSize: 11.8,
+                              fontWeight: selected
+                                  ? FontWeight.w800
+                                  : FontWeight.w500,
+                              color: selected
+                                  ? Colors.white
+                                  : Colors.white.withValues(alpha: 0.72),
+                            ),
+                          ),
+                        ),
+                        if (item.badge != null && item.badge! > 0)
+                          Container(
+                            constraints: const BoxConstraints(minWidth: 20),
+                            height: 20,
+                            padding: const EdgeInsets.symmetric(horizontal: 5),
+                            decoration: BoxDecoration(
+                              color: selected ? AppColors.gold : Colors.white,
+                              borderRadius: BorderRadius.circular(3),
+                            ),
+                            alignment: Alignment.center,
+                            child: Text(
+                              '${item.badge}',
+                              style: TextStyle(
+                                color: selected
+                                    ? AppColors.navyInk
+                                    : AppColors.navyDeep,
+                                fontSize: 9.5,
+                                fontWeight: FontWeight.w900,
+                              ),
+                            ),
+                          ),
+                      ],
+                      if (collapsed &&
+                          item.badge != null &&
+                          item.badge! > 0) ...[
+                        const SizedBox(width: 3),
+                        Container(
+                          constraints: const BoxConstraints(minWidth: 14),
+                          height: 14,
+                          padding: const EdgeInsets.symmetric(horizontal: 3),
+                          decoration: BoxDecoration(
+                            color: AppColors.gold,
+                            borderRadius: BorderRadius.circular(3),
+                          ),
+                          alignment: Alignment.center,
+                          child: Text(
+                            '${item.badge}',
+                            style: const TextStyle(
+                              color: AppColors.navyInk,
+                              fontSize: 7.5,
+                              fontWeight: FontWeight.w900,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
               ],
             ),
           ),
@@ -2753,77 +5787,90 @@ class KpiCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.all(18),
       decoration: BoxDecoration(
         color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: AppColors.border),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: const Color(0xFFCBD5E1)),
         boxShadow: [
           BoxShadow(
             color: AppColors.navy.withValues(alpha: 0.045),
-            blurRadius: 18,
-            offset: const Offset(0, 7),
+            blurRadius: 14,
+            offset: const Offset(0, 5),
           ),
         ],
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Container(
-                width: 44,
-                height: 44,
-                decoration: BoxDecoration(
-                  color: color.withValues(alpha: 0.09),
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: color.withValues(alpha: 0.12)),
-                ),
-                child: Icon(icon, size: 21, color: color),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Container(height: 4, color: color),
+            Padding(
+              padding: const EdgeInsets.all(18),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Container(
+                        width: 44,
+                        height: 44,
+                        decoration: BoxDecoration(
+                          color: color.withValues(alpha: 0.09),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(
+                            color: color.withValues(alpha: 0.12),
+                          ),
+                        ),
+                        child: Icon(icon, size: 21, color: color),
+                      ),
+                      const Spacer(),
+                      pill ?? const SizedBox.shrink(),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  Text(
+                    label.toUpperCase(),
+                    style: const TextStyle(
+                      fontSize: 9.2,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 0.95,
+                      color: AppColors.muted,
+                    ),
+                  ),
+                  const SizedBox(height: 5),
+                  FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      value,
+                      maxLines: 1,
+                      style: const TextStyle(
+                        fontSize: 26,
+                        fontWeight: FontWeight.w900,
+                        letterSpacing: -0.8,
+                        color: AppColors.navyInk,
+                        height: 1.05,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 5),
+                  Text(
+                    helper,
+                    maxLines: 3,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 10.5,
+                      color: AppColors.muted,
+                      height: 1.35,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ],
               ),
-              const Spacer(),
-              pill ?? const SizedBox.shrink(),
-            ],
-          ),
-          const SizedBox(height: 16),
-          Text(
-            label.toUpperCase(),
-            style: const TextStyle(
-              fontSize: 9.2,
-              fontWeight: FontWeight.w800,
-              letterSpacing: 0.95,
-              color: AppColors.muted,
             ),
-          ),
-          const SizedBox(height: 5),
-          FittedBox(
-            fit: BoxFit.scaleDown,
-            alignment: Alignment.centerLeft,
-            child: Text(
-              value,
-              maxLines: 1,
-              style: const TextStyle(
-                fontSize: 26,
-                fontWeight: FontWeight.w900,
-                letterSpacing: -0.8,
-                color: AppColors.navyInk,
-                height: 1.05,
-              ),
-            ),
-          ),
-          const SizedBox(height: 5),
-          Text(
-            helper,
-            maxLines: 3,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(
-              fontSize: 10.5,
-              color: AppColors.muted,
-              height: 1.35,
-              fontWeight: FontWeight.w500,
-            ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -2852,18 +5899,18 @@ class SectionCard extends StatelessWidget {
     return Container(
       decoration: BoxDecoration(
         color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: AppColors.border),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color(0xFFCBD5E1)),
         boxShadow: [
           BoxShadow(
             color: AppColors.navy.withValues(alpha: 0.035),
-            blurRadius: 18,
-            offset: const Offset(0, 7),
+            blurRadius: 14,
+            offset: const Offset(0, 5),
           ),
         ],
       ),
       child: ClipRRect(
-        borderRadius: BorderRadius.circular(16),
+        borderRadius: BorderRadius.circular(10),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
@@ -2888,6 +5935,8 @@ class SectionCard extends StatelessWidget {
                         children: [
                           Text(
                             title!,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
                             style: const TextStyle(
                               fontSize: 14.5,
                               fontWeight: FontWeight.w800,
@@ -2898,6 +5947,8 @@ class SectionCard extends StatelessWidget {
                             const SizedBox(height: 2),
                             Text(
                               subtitle!,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
                               style: const TextStyle(
                                 fontSize: 10.8,
                                 color: AppColors.muted,
@@ -2909,8 +5960,15 @@ class SectionCard extends StatelessWidget {
                       ),
                     ),
                     if (trailing != null) ...[
-                      const SizedBox(width: 12),
-                      trailing!,
+                      const SizedBox(width: 10),
+                      ConstrainedBox(
+                        constraints: BoxConstraints(
+                          maxWidth: MediaQuery.of(context).size.width > 600
+                              ? 220
+                              : 140,
+                        ),
+                        child: trailing!,
+                      ),
                     ],
                   ],
                 ),
@@ -2984,7 +6042,7 @@ class AppButton extends StatelessWidget {
               padding: padding,
               minimumSize: Size(0, height),
               shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(9),
+                borderRadius: BorderRadius.circular(3),
               ),
               elevation: 0,
             ),
@@ -2998,7 +6056,7 @@ class AppButton extends StatelessWidget {
               padding: padding,
               minimumSize: Size(0, height),
               shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(9),
+                borderRadius: BorderRadius.circular(3),
               ),
             ),
             child: content,
@@ -3023,7 +6081,7 @@ class StatusPill extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5.5),
       decoration: BoxDecoration(
         color: status.bg,
-        borderRadius: BorderRadius.circular(999),
+        borderRadius: BorderRadius.circular(4),
         border: Border.all(color: status.border),
       ),
       child: Row(
@@ -3064,7 +6122,7 @@ class ComplianceBadge extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6),
       decoration: BoxDecoration(
         color: bg,
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(4),
         border: Border.all(color: border),
       ),
       child: Row(
@@ -3153,7 +6211,7 @@ class MaturityUrgencyChip extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
       decoration: BoxDecoration(
         color: background,
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(4),
         border: Border.all(color: border),
       ),
       child: Row(
@@ -3240,7 +6298,7 @@ class SoftChip extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
       decoration: BoxDecoration(
         color: color.withValues(alpha: 0.07),
-        borderRadius: BorderRadius.circular(7),
+        borderRadius: BorderRadius.circular(4),
         border: Border.all(color: color.withValues(alpha: 0.14)),
       ),
       child: Row(
@@ -3291,45 +6349,63 @@ class InfoBanner extends StatelessWidget {
         borderRadius: BorderRadius.circular(12),
         border: Border.all(color: color.withValues(alpha: 0.13)),
       ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Container(
-            width: 32,
-            height: 32,
-            decoration: BoxDecoration(
-              color: color.withValues(alpha: 0.10),
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: Icon(icon, size: 17, color: color),
-          ),
-          const SizedBox(width: 11),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  title,
-                  style: TextStyle(
-                    fontSize: 11.5,
-                    fontWeight: FontWeight.w800,
-                    color: color,
-                  ),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final content = Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Container(
+                width: 32,
+                height: 32,
+                decoration: BoxDecoration(
+                  color: color.withValues(alpha: 0.10),
+                  borderRadius: BorderRadius.circular(8),
                 ),
-                const SizedBox(height: 2),
-                Text(
-                  message,
-                  style: const TextStyle(
-                    fontSize: 10.5,
-                    color: AppColors.muted,
-                    height: 1.45,
-                  ),
+                child: Icon(icon, size: 17, color: color),
+              ),
+              const SizedBox(width: 11),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w800,
+                        color: color,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      message,
+                      style: const TextStyle(
+                        fontSize: 10.5,
+                        color: AppColors.muted,
+                        height: 1.45,
+                      ),
+                    ),
+                  ],
                 ),
+              ),
+              if (trailing != null && constraints.maxWidth >= 520) ...[
+                const SizedBox(width: 12),
+                trailing!,
               ],
-            ),
-          ),
-          if (trailing != null) ...[const SizedBox(width: 12), trailing!],
-        ],
+            ],
+          );
+          if (trailing == null || constraints.maxWidth >= 520) {
+            return content;
+          }
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              content,
+              const SizedBox(height: 10),
+              Align(alignment: Alignment.centerLeft, child: trailing!),
+            ],
+          );
+        },
       ),
     );
   }
@@ -3416,6 +6492,11 @@ class TableScroll extends StatelessWidget {
   }
 }
 
+/// Alternating government table rows: white for even indices, #F8FAFC for odd.
+WidgetStateProperty<Color?> portalRowColor(int index) => WidgetStatePropertyAll(
+  index.isEven ? Colors.white : const Color(0xFFF8FAFC),
+);
+
 // -----------------------------------------------------------------------------
 // Shared helpers & dialogs
 // -----------------------------------------------------------------------------
@@ -3471,8 +6552,12 @@ Future<bool> showConfirmDialog(
     barrierColor: AppColors.navyInk.withValues(alpha: 0.46),
     builder: (dialogContext) {
       return AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(6),
+          side: BorderSide(color: AppColors.navy.withValues(alpha: 0.22)),
+        ),
         backgroundColor: Colors.white,
+        surfaceTintColor: Colors.white,
         insetPadding: const EdgeInsets.all(24),
         title: Row(
           children: [
@@ -3621,7 +6706,12 @@ class _ReasonDialogState extends State<_ReasonDialog> {
   Widget build(BuildContext context) {
     final reason = _controller.text.trim();
     return AlertDialog(
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(6),
+        side: BorderSide(color: AppColors.navy.withValues(alpha: 0.22)),
+      ),
+      backgroundColor: Colors.white,
+      surfaceTintColor: Colors.white,
       insetPadding: const EdgeInsets.all(24),
       title: Row(
         children: [
@@ -3751,12 +6841,13 @@ class PortalDialogFrame extends StatelessWidget {
             children: [
               Container(
                 padding: const EdgeInsets.fromLTRB(22, 18, 12, 17),
-                decoration: const BoxDecoration(
-                  gradient: LinearGradient(
+                decoration: BoxDecoration(
+                  gradient: const LinearGradient(
                     colors: [AppColors.navyDeep, AppColors.navy],
                     begin: Alignment.topLeft,
                     end: Alignment.bottomRight,
                   ),
+                  border: Border(bottom: BorderSide(color: accent, width: 3)),
                 ),
                 child: Row(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -3858,6 +6949,291 @@ class PortalDialogFrame extends StatelessWidget {
 // -----------------------------------------------------------------------------
 // Dashboard 1: Institute / College Admin
 // -----------------------------------------------------------------------------
+
+/// High-priority pre-maturity advisory shown on the Institute dashboard when
+/// an FDR enters the automated 90 / 60 / 30-day Email + SMS alert horizon.
+class _PreMaturityAdvisoryBanner extends StatelessWidget {
+  const _PreMaturityAdvisoryBanner({required this.state});
+
+  final PortalState state;
+
+  ({String email, String mobile}) get _registeredContact {
+    final record = state.nearestPreMaturityRecord;
+    if (record != null) {
+      for (final log in state.notificationLogs) {
+        if (log.fdrNumber == record.id && log.recipientEmail.isNotEmpty) {
+          return (email: log.recipientEmail, mobile: log.recipientMobile);
+        }
+      }
+    }
+    return (email: state.credential.userId, mobile: '+91-9840012310');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final record = state.nearestPreMaturityRecord;
+    if (record == null) return const SizedBox.shrink();
+    final days = record.daysToMaturity;
+    final window = days <= 30
+        ? '30_DAYS'
+        : days <= 60
+        ? '60_DAYS'
+        : '90_DAYS';
+    final title = switch (window) {
+      '30_DAYS' => '30-Day Critical Maturity Window',
+      '60_DAYS' => '60-Day Follow-Up Maturity Window',
+      _ => '90-Day Pre-Maturity Advisory Window',
+    };
+    final accent = switch (window) {
+      '30_DAYS' => AppColors.red,
+      '60_DAYS' => AppColors.orange,
+      _ => AppColors.indigo,
+    };
+    final tint = switch (window) {
+      '30_DAYS' => const Color(0xFFFEF2F2),
+      '60_DAYS' => const Color(0xFFFFF7ED),
+      _ => const Color(0xFFEEF2FF),
+    };
+    final contact = _registeredContact;
+    final total = state.preMaturityRecords.length;
+
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [tint, Colors.white],
+        ),
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: accent.withValues(alpha: 0.34)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final wide = constraints.maxWidth >= 860;
+              final heading = Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    width: 40,
+                    height: 40,
+                    decoration: BoxDecoration(
+                      color: accent.withValues(alpha: 0.10),
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(color: accent.withValues(alpha: 0.24)),
+                    ),
+                    child: Icon(
+                      Icons.campaign_rounded,
+                      size: 20,
+                      color: accent,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'AICTE FINANCE BUREAU • $title',
+                          style: TextStyle(
+                            fontSize: 8.8,
+                            fontWeight: FontWeight.w900,
+                            letterSpacing: 0.7,
+                            color: accent,
+                          ),
+                        ),
+                        const SizedBox(height: 3),
+                        Text(
+                          'FDR ${record.id} matures in $days day${days == 1 ? '' : 's'}',
+                          style: const TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w900,
+                            color: AppColors.navyInk,
+                          ),
+                        ),
+                        const SizedBox(height: 3),
+                        Text(
+                          '${record.bankName} • ${record.program} • '
+                          '${inr(record.amount)} principal • Maturity '
+                          '${formatDate(record.maturityDate)}',
+                          style: const TextStyle(
+                            fontSize: 9.6,
+                            height: 1.4,
+                            color: AppColors.muted,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              );
+              final counter = Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 8,
+                ),
+                decoration: BoxDecoration(
+                  color: accent.withValues(alpha: 0.08),
+                  borderRadius: BorderRadius.circular(4),
+                  border: Border.all(color: accent.withValues(alpha: 0.26)),
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      '$days',
+                      style: TextStyle(
+                        fontSize: 22,
+                        fontWeight: FontWeight.w900,
+                        height: 1,
+                        letterSpacing: -0.6,
+                        color: accent,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      days == 1 ? 'DAY TO MATURITY' : 'DAYS TO MATURITY',
+                      style: TextStyle(
+                        fontSize: 7,
+                        fontWeight: FontWeight.w900,
+                        letterSpacing: 0.5,
+                        color: accent,
+                      ),
+                    ),
+                  ],
+                ),
+              );
+              if (!wide) {
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    heading,
+                    const SizedBox(height: 10),
+                    Align(alignment: Alignment.centerLeft, child: counter),
+                  ],
+                );
+              }
+              return Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(child: heading),
+                  const SizedBox(width: 14),
+                  counter,
+                ],
+              );
+            },
+          ),
+          const SizedBox(height: 11),
+          Container(
+            padding: const EdgeInsets.all(11),
+            decoration: BoxDecoration(
+              color: Colors.white.withValues(alpha: 0.82),
+              borderRadius: BorderRadius.circular(4),
+              border: Border.all(color: accent.withValues(alpha: 0.18)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Icon(
+                      Icons.mark_email_read_rounded,
+                      size: 14,
+                      color: AppColors.emeraldDark,
+                    ),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        'Official advisory already dispatched to the registered '
+                        'Email & Mobile of the institute nodal officer through '
+                        'the NIC-SMS / SMTP gateway.',
+                        style: const TextStyle(
+                          fontSize: 9.6,
+                          height: 1.45,
+                          fontWeight: FontWeight.w600,
+                          color: AppColors.emeraldDark,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 5),
+                Wrap(
+                  spacing: 12,
+                  runSpacing: 4,
+                  children: [
+                    _AdvisoryContactLine(
+                      icon: Icons.alternate_email_rounded,
+                      label: contact.email,
+                    ),
+                    _AdvisoryContactLine(
+                      icon: Icons.phone_android_rounded,
+                      label: contact.mobile.isEmpty ? 'N/A' : contact.mobile,
+                    ),
+                    _AdvisoryContactLine(
+                      icon: Icons.inventory_2_rounded,
+                      label:
+                          '$total FDR${total == 1 ? '' : 's'} in the 90-day watchlist',
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'Please file the Release Application or the renewed 2-year FDR '
+            'through the e-Kosh portal before maturity to avoid encashment '
+            'and penalty action.',
+            style: TextStyle(
+              fontSize: 9.2,
+              height: 1.45,
+              fontStyle: FontStyle.italic,
+              color: accent.withValues(alpha: 0.92),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _AdvisoryContactLine extends StatelessWidget {
+  const _AdvisoryContactLine({required this.icon, required this.label});
+
+  final IconData icon;
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 320),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 11, color: AppColors.navy),
+          const SizedBox(width: 4),
+          Flexible(
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                fontSize: 9,
+                fontWeight: FontWeight.w700,
+                color: AppColors.navyInk,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
 
 class _MaturityAlertBanner extends StatelessWidget {
   const _MaturityAlertBanner({required this.state});
@@ -4041,6 +7417,8 @@ class InstitutePortfolioPage extends StatelessWidget {
         ],
       ),
       children: [
+        if (state.nearestPreMaturityRecord != null)
+          _PreMaturityAdvisoryBanner(state: state),
         if (state.instituteRecords.any(
               (record) => record.isOverdue && !record.status.isClosed,
             ) &&
@@ -4125,13 +7503,13 @@ class InstitutePortfolioPage extends StatelessWidget {
                     dataRowMinHeight: 78,
                     dataRowMaxHeight: 96,
                     headingRowColor: const WidgetStatePropertyAll(
-                      AppColors.surfaceSoft,
+                      AppColors.navy,
                     ),
                     headingTextStyle: const TextStyle(
                       fontSize: 9,
                       fontWeight: FontWeight.w900,
                       letterSpacing: 0.8,
-                      color: AppColors.muted,
+                      color: Colors.white,
                     ),
                     dataTextStyle: const TextStyle(
                       fontSize: 11.5,
@@ -4150,7 +7528,9 @@ class InstitutePortfolioPage extends StatelessWidget {
                       DataColumn(label: Text('LIFECYCLE STATUS')),
                       DataColumn(label: Text('ACTION')),
                     ],
-                    rows: records.map((record) {
+                    rows: records.asMap().entries.map((entry) {
+                      final rowIndex = entry.key;
+                      final record = entry.value;
                       final canApply =
                           record.status == FDRStatus.activeLienLocked &&
                           record.isMatured;
@@ -4158,6 +7538,7 @@ class InstitutePortfolioPage extends StatelessWidget {
                           record.status == FDRStatus.onHoldExtension;
                       final hasEnoc = record.hasEnoc;
                       return DataRow(
+                        color: portalRowColor(rowIndex),
                         onSelectChanged: (_) =>
                             showTrackerDialog(context, record),
                         cells: [
@@ -6400,13 +9781,13 @@ class BankVerificationPage extends StatelessWidget {
                     dataRowMinHeight: 72,
                     dataRowMaxHeight: 88,
                     headingRowColor: const WidgetStatePropertyAll(
-                      AppColors.surfaceSoft,
+                      AppColors.navy,
                     ),
                     headingTextStyle: const TextStyle(
                       fontSize: 9,
                       fontWeight: FontWeight.w900,
                       letterSpacing: 0.8,
-                      color: AppColors.muted,
+                      color: Colors.white,
                     ),
                     dataTextStyle: const TextStyle(
                       fontSize: 11.5,
@@ -6424,8 +9805,11 @@ class BankVerificationPage extends StatelessWidget {
                       DataColumn(label: Text('STATUS')),
                       DataColumn(label: Text('ACTION')),
                     ],
-                    rows: queue.map((record) {
+                    rows: queue.asMap().entries.map((entry) {
+                      final rowIndex = entry.key;
+                      final record = entry.value;
                       return DataRow(
+                        color: portalRowColor(rowIndex),
                         onSelectChanged: (_) =>
                             showReceiptDialog(context, state, record),
                         cells: [
@@ -7381,6 +10765,7 @@ class BankSettlementPage extends StatelessWidget {
                     ) ...[
                       if (index > 0) const SizedBox(height: 12),
                       BankReleaseCard(
+                        key: ValueKey('release-${releaseQueue[index].id}'),
                         record: releaseQueue[index],
                         state: state,
                         onDisburse: () =>
@@ -7417,13 +10802,13 @@ class BankSettlementPage extends StatelessWidget {
                     dataRowMinHeight: 58,
                     dataRowMaxHeight: 68,
                     headingRowColor: const WidgetStatePropertyAll(
-                      AppColors.surfaceSoft,
+                      AppColors.navy,
                     ),
                     headingTextStyle: const TextStyle(
                       fontSize: 9,
                       fontWeight: FontWeight.w900,
                       letterSpacing: 0.8,
-                      color: AppColors.muted,
+                      color: Colors.white,
                     ),
                     dividerThickness: 1,
                     border: const TableBorder(
@@ -7436,8 +10821,11 @@ class BankSettlementPage extends StatelessWidget {
                       DataColumn(label: Text('SETTLED ON')),
                       DataColumn(label: Text('STATUS')),
                     ],
-                    rows: state.disbursedRecords.map((record) {
+                    rows: state.disbursedRecords.asMap().entries.map((entry) {
+                      final rowIndex = entry.key;
+                      final record = entry.value;
                       return DataRow(
+                        color: portalRowColor(rowIndex),
                         cells: [
                           DataCell(
                             Column(
@@ -7925,13 +11313,13 @@ class RoScrutinyPage extends StatelessWidget {
                     dataRowMinHeight: 86,
                     dataRowMaxHeight: 110,
                     headingRowColor: const WidgetStatePropertyAll(
-                      AppColors.surfaceSoft,
+                      AppColors.navy,
                     ),
                     headingTextStyle: const TextStyle(
                       fontSize: 9,
                       fontWeight: FontWeight.w900,
                       letterSpacing: 0.8,
-                      color: AppColors.muted,
+                      color: Colors.white,
                     ),
                     dataTextStyle: const TextStyle(
                       fontSize: 11.5,
@@ -7950,8 +11338,11 @@ class RoScrutinyPage extends StatelessWidget {
                       DataColumn(label: Text('COMPLIANCE STATUS')),
                       DataColumn(label: Text('RO ACTION')),
                     ],
-                    rows: queue.map((record) {
+                    rows: queue.asMap().entries.map((entry) {
+                      final rowIndex = entry.key;
+                      final record = entry.value;
                       return DataRow(
+                        color: portalRowColor(rowIndex),
                         cells: [
                           DataCell(
                             Column(
@@ -8819,6 +12210,869 @@ class _OnHoldCard extends StatelessWidget {
 // Dashboard 4: AICTE Finance Bureau HQ
 // -----------------------------------------------------------------------------
 
+// -----------------------------------------------------------------------------
+// Finance HQ: automated 90 / 60 / 30-day Email + SMS dispatch engine
+// -----------------------------------------------------------------------------
+
+class _MaturityDispatchEnginePanel extends StatefulWidget {
+  const _MaturityDispatchEnginePanel({required this.state});
+
+  final PortalState state;
+
+  @override
+  State<_MaturityDispatchEnginePanel> createState() =>
+      _MaturityDispatchEnginePanelState();
+}
+
+class _MaturityDispatchEnginePanelState
+    extends State<_MaturityDispatchEnginePanel> {
+  bool _working = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _autoScan());
+  }
+
+  Future<void> _autoScan() async {
+    final state = widget.state;
+    await state.fetchNotificationLogs(notify: false);
+    final dispatched = await state.ensureAutomaticNotificationCheck();
+    if (!mounted) return;
+    setState(() {});
+    if (dispatched > 0) {
+      showAppToast(
+        context,
+        '📨 Automated maturity check complete • $dispatched official Email + '
+        'SMS advisory bundle${dispatched == 1 ? '' : 's'} dispatched by the '
+        'NIC-SMS / SMTP gateway.',
+        icon: Icons.mark_email_read_rounded,
+        color: AppColors.indigo,
+      );
+    }
+  }
+
+  Future<void> _runManualScan() async {
+    if (_working) return;
+    setState(() => _working = true);
+    final dispatched = await widget.state.runMaturityNotificationScan();
+    if (!mounted) return;
+    setState(() => _working = false);
+    showAppToast(
+      context,
+      dispatched > 0
+          ? '⚡ 90/60/30-day scan complete • $dispatched Email + SMS advisory '
+                'bundle${dispatched == 1 ? '' : 's'} dispatched to institute '
+                'nodal officers and the Finance Bureau.'
+          : '90/60/30-day scan complete • no qualifying FDRs required a fresh '
+                'dispatch. Gateway ledger is up to date.',
+      icon: dispatched > 0 ? Icons.campaign_rounded : Icons.fact_check_rounded,
+      color: dispatched > 0 ? AppColors.indigo : AppColors.emeraldDark,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final state = widget.state;
+    final busy = _working || state.notificationScanBusy;
+    return SectionCard(
+      title:
+          '📡 Automated Pre-Maturity Email & SMS Dispatch Engine (NIC-SMS / SMTP Gateway)',
+      subtitle:
+          'AICTE Finance Bureau • background scheduler armed on server startup '
+          'and every 24 hours for the 90-day advisory, 60-day follow-up and '
+          '30-day critical windows.',
+      accentColor: AppColors.indigo,
+      trailing: SoftChip(
+        label: busy
+            ? 'SCANNING GATEWAY'
+            : state.notificationGatewayStatus == 'DISPATCHED'
+            ? 'DISPATCHED'
+            : '24H AUTO-CRON ACTIVE',
+        icon: busy ? Icons.sync_rounded : Icons.verified_user_rounded,
+        color: busy ? AppColors.orange : AppColors.emeraldDark,
+      ),
+      contentPadding: const EdgeInsets.all(18),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final width = constraints.maxWidth;
+              final columns = width >= 980
+                  ? 3
+                  : width >= 640
+                  ? 2
+                  : 1;
+              final cardWidth = (width - 12 * (columns - 1)) / columns;
+              return Wrap(
+                spacing: 12,
+                runSpacing: 12,
+                children: [
+                  SizedBox(
+                    width: cardWidth,
+                    child: _MilestoneWindowCard(
+                      icon: Icons.event_available_rounded,
+                      title: '90-Day Advisory Window',
+                      count: state.notificationWithin90,
+                      badge: 'ACTIVE',
+                      description:
+                          'FDRs maturing in 61–90 days receive the official '
+                          'pre-maturity advisory with release and renewal guidance.',
+                      color: AppColors.indigo,
+                    ),
+                  ),
+                  SizedBox(
+                    width: cardWidth,
+                    child: _MilestoneWindowCard(
+                      icon: Icons.notifications_active_rounded,
+                      title: '60-Day Follow-Up Window',
+                      count: state.notificationWithin60,
+                      badge: 'ACTIVE',
+                      description:
+                          'FDRs maturing in 31–60 days receive a follow-up '
+                          'reminder to confirm lien status and settlement intent.',
+                      color: AppColors.orange,
+                    ),
+                  ),
+                  SizedBox(
+                    width: cardWidth,
+                    child: _MilestoneWindowCard(
+                      icon: Icons.crisis_alert_rounded,
+                      title: '30-Day Critical Window',
+                      count: state.notificationWithin30,
+                      badge: 'URGENT AUTO-ALERT',
+                      description:
+                          'FDRs maturing within 30 days receive the final '
+                          'notice to file a release application or 2-year renewal.',
+                      color: AppColors.red,
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+          const SizedBox(height: 14),
+          Container(
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: AppColors.indigo.withValues(alpha: 0.045),
+              borderRadius: BorderRadius.circular(4),
+              border: Border.all(
+                color: AppColors.indigo.withValues(alpha: 0.16),
+              ),
+            ),
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final wide = constraints.maxWidth >= 900;
+                final messaging = Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Container(
+                      width: 34,
+                      height: 34,
+                      decoration: BoxDecoration(
+                        color: AppColors.indigo.withValues(alpha: 0.10),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: busy
+                          ? const Padding(
+                              padding: EdgeInsets.all(8),
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: AppColors.indigo,
+                              ),
+                            )
+                          : const Icon(
+                              Icons.hub_rounded,
+                              size: 18,
+                              color: AppColors.indigo,
+                            ),
+                    ),
+                    const SizedBox(width: 11),
+                    const Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'NIC-SMS / SMTP GATEWAY • EMAIL + SMS DELIVERY',
+                            style: TextStyle(
+                              fontSize: 8.6,
+                              fontWeight: FontWeight.w900,
+                              letterSpacing: 0.75,
+                              color: AppColors.indigo,
+                            ),
+                          ),
+                          SizedBox(height: 3),
+                          Text(
+                            'Each dispatch is written to the immutable gateway '
+                            'ledger and audit trail with the exact recipient '
+                            'email, mobile number and official message text.',
+                            style: TextStyle(
+                              fontSize: 10.2,
+                              height: 1.45,
+                              color: AppColors.muted,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                );
+                final button = AppButton(
+                  label: '⚡ Run 90/60/30-Day Auto-Dispatch Scan Now',
+                  icon: Icons.bolt_rounded,
+                  color: AppColors.indigo,
+                  onPressed: busy ? null : _runManualScan,
+                );
+                if (!wide) {
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      messaging,
+                      const SizedBox(height: 11),
+                      Align(alignment: Alignment.centerLeft, child: button),
+                    ],
+                  );
+                }
+                return Row(
+                  children: [
+                    Expanded(child: messaging),
+                    const SizedBox(width: 16),
+                    button,
+                  ],
+                );
+              },
+            ),
+          ),
+          const SizedBox(height: 16),
+          _buildGatewayTable(context, state),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildGatewayTable(BuildContext context, PortalState state) {
+    final logs = state.notificationLogs.take(25).toList();
+    if (logs.isEmpty) {
+      return const EmptyState(
+        title: 'No Email / SMS advisories dispatched yet',
+        message:
+            'The 24-hour scheduler will dispatch automatically when an FDR '
+            'enters the 90, 60 or 30-day maturity window. Use the manual scan '
+            'button to run the engine immediately.',
+        icon: Icons.mark_email_unread_rounded,
+        color: AppColors.indigo,
+      );
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            const Icon(
+              Icons.receipt_long_rounded,
+              size: 15,
+              color: AppColors.navy,
+            ),
+            const SizedBox(width: 6),
+            const Expanded(
+              child: Text(
+                'DISPATCHED EMAIL & SMS GATEWAY LOG',
+                style: TextStyle(
+                  fontSize: 9.4,
+                  fontWeight: FontWeight.w900,
+                  letterSpacing: 0.8,
+                  color: AppColors.navyInk,
+                ),
+              ),
+            ),
+            Text(
+              '${logs.length} ledger entr${logs.length == 1 ? 'y' : 'ies'}'
+              '${logs.length >= 25 ? ' • showing latest 25' : ''}',
+              style: const TextStyle(
+                fontSize: 8.6,
+                fontWeight: FontWeight.w700,
+                color: AppColors.muted,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Container(
+          decoration: BoxDecoration(
+            border: Border.all(color: AppColors.border),
+            borderRadius: BorderRadius.circular(4),
+          ),
+          clipBehavior: Clip.antiAlias,
+          child: TableScroll(
+            minWidth: 1450,
+            child: DataTable(
+              showCheckboxColumn: false,
+              horizontalMargin: 16,
+              columnSpacing: 18,
+              headingRowHeight: 44,
+              dataRowMinHeight: 66,
+              dataRowMaxHeight: 84,
+              headingRowColor: const WidgetStatePropertyAll(AppColors.navy),
+              headingTextStyle: const TextStyle(
+                fontSize: 8.8,
+                fontWeight: FontWeight.w900,
+                letterSpacing: 0.7,
+                color: Colors.white,
+              ),
+              columns: const [
+                DataColumn(label: Text('TIMESTAMP')),
+                DataColumn(label: Text('FDR NUMBER')),
+                DataColumn(label: Text('INSTITUTE NAME')),
+                DataColumn(label: Text('MILESTONE')),
+                DataColumn(label: Text('CHANNELS')),
+                DataColumn(label: Text('RECIPIENT CONTACT')),
+                DataColumn(label: Text('OFFICIAL MESSAGE')),
+              ],
+              rows: logs.asMap().entries.map((entry) {
+                final rowIndex = entry.key;
+                final log = entry.value;
+                return DataRow(
+                  color: portalRowColor(rowIndex),
+                  cells: [
+                    DataCell(
+                      Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            formatDateTime(log.timestamp),
+                            style: const TextStyle(
+                              fontSize: 9.4,
+                              fontWeight: FontWeight.w700,
+                              color: AppColors.navyInk,
+                            ),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            log.isAutomatic
+                                ? 'AUTO CRON SCHEDULER'
+                                : 'FINANCE HQ MANUAL',
+                            style: TextStyle(
+                              fontSize: 7.4,
+                              fontWeight: FontWeight.w800,
+                              letterSpacing: 0.35,
+                              color: log.isAutomatic
+                                  ? AppColors.emeraldDark
+                                  : AppColors.indigo,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    DataCell(
+                      Text(
+                        log.fdrNumber,
+                        style: const TextStyle(
+                          fontSize: 10.2,
+                          fontWeight: FontWeight.w900,
+                          color: AppColors.navy,
+                        ),
+                      ),
+                    ),
+                    DataCell(
+                      SizedBox(
+                        width: 190,
+                        child: Text(
+                          log.instituteName,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontSize: 9.4,
+                            height: 1.3,
+                            color: AppColors.ink,
+                          ),
+                        ),
+                      ),
+                    ),
+                    DataCell(_GatewayMilestoneBadge(log: log)),
+                    DataCell(
+                      Wrap(
+                        spacing: 4,
+                        runSpacing: 4,
+                        children: [
+                          if (log.channels.contains('EMAIL'))
+                            const _GatewayChannelTag(
+                              icon: Icons.mail_rounded,
+                              label: 'EMAIL SENT',
+                              color: AppColors.emeraldDark,
+                            ),
+                          if (log.channels.contains('SMS'))
+                            const _GatewayChannelTag(
+                              icon: Icons.sms_rounded,
+                              label: 'SMS SENT',
+                              color: AppColors.indigo,
+                            ),
+                        ],
+                      ),
+                    ),
+                    DataCell(
+                      SizedBox(
+                        width: 178,
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              log.recipientEmail,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                fontSize: 8.8,
+                                fontWeight: FontWeight.w600,
+                                color: AppColors.ink,
+                              ),
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              log.recipientMobile,
+                              style: const TextStyle(
+                                fontSize: 8.8,
+                                fontWeight: FontWeight.w600,
+                                color: AppColors.muted,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    DataCell(
+                      AppButton(
+                        label: 'View Official Message',
+                        icon: Icons.visibility_rounded,
+                        primary: false,
+                        dense: true,
+                        color: AppColors.navy,
+                        onPressed: () =>
+                            showMaturityNotificationPreview(context, log),
+                      ),
+                    ),
+                  ],
+                );
+              }).toList(),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _MilestoneWindowCard extends StatelessWidget {
+  const _MilestoneWindowCard({
+    required this.icon,
+    required this.title,
+    required this.count,
+    required this.badge,
+    required this.description,
+    required this.color,
+  });
+
+  final IconData icon;
+  final String title;
+  final int count;
+  final String badge;
+  final String description;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: const Color(0xFFCBD5E1)),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Container(height: 4, color: color),
+          Padding(
+            padding: const EdgeInsets.all(14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Container(
+                      width: 34,
+                      height: 34,
+                      decoration: BoxDecoration(
+                        color: color.withValues(alpha: 0.09),
+                        borderRadius: BorderRadius.circular(4),
+                        border: Border.all(
+                          color: color.withValues(alpha: 0.16),
+                        ),
+                      ),
+                      child: Icon(icon, size: 17, color: color),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Align(
+                        alignment: Alignment.centerRight,
+                        child: ConstrainedBox(
+                          constraints: const BoxConstraints(maxWidth: 96),
+                          child: Text(
+                            badge,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            textAlign: TextAlign.right,
+                            style: TextStyle(
+                              fontSize: 7,
+                              fontWeight: FontWeight.w900,
+                              letterSpacing: 0.55,
+                              color: color,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 11),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    Text(
+                      '$count',
+                      style: TextStyle(
+                        fontSize: 27,
+                        fontWeight: FontWeight.w900,
+                        height: 1,
+                        letterSpacing: -0.6,
+                        color: color,
+                      ),
+                    ),
+                    const SizedBox(width: 5),
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 3),
+                      child: Text(
+                        count == 1 ? 'FDR' : 'FDRs',
+                        style: const TextStyle(
+                          fontSize: 8.6,
+                          fontWeight: FontWeight.w800,
+                          letterSpacing: 0.45,
+                          color: AppColors.muted,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  title.toUpperCase(),
+                  style: const TextStyle(
+                    fontSize: 8.8,
+                    fontWeight: FontWeight.w900,
+                    letterSpacing: 0.55,
+                    color: AppColors.navyInk,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  description,
+                  style: const TextStyle(
+                    fontSize: 9.2,
+                    height: 1.4,
+                    color: AppColors.muted,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _GatewayMilestoneBadge extends StatelessWidget {
+  const _GatewayMilestoneBadge({required this.log});
+
+  final MaturityNotificationLog log;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = log.milestoneColor;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 5),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(3),
+        border: Border.all(color: color.withValues(alpha: 0.24)),
+      ),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '${log.milestoneShort} WINDOW',
+            style: TextStyle(
+              fontSize: 8,
+              fontWeight: FontWeight.w900,
+              letterSpacing: 0.5,
+              color: color,
+            ),
+          ),
+          const SizedBox(height: 1),
+          Text(
+            log.daysToMaturity == null
+                ? log.milestoneLabel
+                : '${log.daysToMaturity} days left',
+            style: TextStyle(
+              fontSize: 7.4,
+              fontWeight: FontWeight.w600,
+              color: color.withValues(alpha: 0.85),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _GatewayChannelTag extends StatelessWidget {
+  const _GatewayChannelTag({
+    required this.icon,
+    required this.label,
+    required this.color,
+  });
+
+  final IconData icon;
+  final String label;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.07),
+        borderRadius: BorderRadius.circular(3),
+        border: Border.all(color: color.withValues(alpha: 0.22)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 10, color: color),
+          const SizedBox(width: 3),
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: 7.2,
+              fontWeight: FontWeight.w900,
+              letterSpacing: 0.35,
+              color: color,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+Future<void> showMaturityNotificationPreview(
+  BuildContext context,
+  MaturityNotificationLog log,
+) {
+  return showDialog<void>(
+    context: context,
+    barrierColor: AppColors.navyInk.withValues(alpha: 0.50),
+    builder: (dialogContext) => PortalDialogFrame(
+      title: 'Official ${log.milestoneLabel} Advisory',
+      icon: '✉️',
+      eyebrow: 'NIC-SMS / SMTP GATEWAY • DELIVERY PROOF',
+      subtitle:
+          'Exact Email and SMS template dispatched to the institute nodal '
+          'officer, with a copy marked to the AICTE Finance Bureau.',
+      maxWidth: 860,
+      accent: log.milestoneColor,
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              SoftChip(
+                label: log.fdrNumber,
+                icon: Icons.account_balance_rounded,
+                color: AppColors.navy,
+              ),
+              SoftChip(
+                label: '${log.milestoneShort} MILESTONE',
+                icon: Icons.timer_rounded,
+                color: log.milestoneColor,
+              ),
+              const SoftChip(
+                label: 'EMAIL + SMS • DELIVERED',
+                icon: Icons.mark_email_read_rounded,
+                color: AppColors.emeraldDark,
+              ),
+              SoftChip(
+                label: log.isAutomatic ? 'AUTO CRON' : 'FINANCE HQ MANUAL',
+                icon: Icons.verified_user_rounded,
+                color: AppColors.indigo,
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final wide = constraints.maxWidth >= 620;
+              final width = wide
+                  ? (constraints.maxWidth - 10) / 2
+                  : constraints.maxWidth;
+              return Wrap(
+                spacing: 10,
+                runSpacing: 8,
+                children: [
+                  SizedBox(
+                    width: width,
+                    child: _GatewayDetailRow(
+                      label: 'Recipient Email',
+                      value: log.recipientEmail,
+                      icon: Icons.alternate_email_rounded,
+                    ),
+                  ),
+                  SizedBox(
+                    width: width,
+                    child: _GatewayDetailRow(
+                      label: 'Recipient Mobile',
+                      value: log.recipientMobile,
+                      icon: Icons.phone_android_rounded,
+                    ),
+                  ),
+                  SizedBox(
+                    width: width,
+                    child: _GatewayDetailRow(
+                      label: 'Institute',
+                      value: log.instituteName,
+                      icon: Icons.school_rounded,
+                    ),
+                  ),
+                  SizedBox(
+                    width: width,
+                    child: _GatewayDetailRow(
+                      label: 'Dispatched On',
+                      value: formatDateTime(log.timestamp),
+                      icon: Icons.schedule_rounded,
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+          const SizedBox(height: 14),
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: const Color(0xFFFFFDF5),
+              borderRadius: BorderRadius.circular(4),
+              border: Border.all(color: const Color(0xFFFCD34D)),
+            ),
+            child: SelectableText(
+              log.messagePreview.isEmpty
+                  ? 'No message body was recorded for this gateway entry.'
+                  : log.messagePreview,
+              style: const TextStyle(
+                fontSize: 10.4,
+                height: 1.55,
+                fontFamily: 'monospace',
+                color: AppColors.ink,
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          const Text(
+            'This is a system-generated government communication. The delivery '
+            'reference and SHA-256 audit hash are retained in the AICTE '
+            'notification ledger.',
+            style: TextStyle(
+              fontSize: 8.8,
+              height: 1.45,
+              fontStyle: FontStyle.italic,
+              color: AppColors.muted,
+            ),
+          ),
+        ],
+      ),
+      actions: [
+        AppButton(
+          label: 'Close Preview',
+          icon: Icons.close_rounded,
+          dense: true,
+          onPressed: () => Navigator.of(dialogContext).pop(),
+        ),
+      ],
+    ),
+  );
+}
+
+class _GatewayDetailRow extends StatelessWidget {
+  const _GatewayDetailRow({
+    required this.label,
+    required this.value,
+    required this.icon,
+  });
+
+  final String label;
+  final String value;
+  final IconData icon;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: AppColors.surfaceSoft,
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, size: 14, color: AppColors.navy),
+          const SizedBox(width: 7),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label.toUpperCase(),
+                  style: const TextStyle(
+                    fontSize: 7.2,
+                    fontWeight: FontWeight.w900,
+                    letterSpacing: 0.5,
+                    color: AppColors.muted,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  value,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 9.6,
+                    fontWeight: FontWeight.w700,
+                    color: AppColors.navyInk,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class FinanceSettlementPage extends StatelessWidget {
   const FinanceSettlementPage({super.key, required this.state});
 
@@ -8897,6 +13151,7 @@ class FinanceSettlementPage extends StatelessWidget {
             ),
           ],
         ),
+        _MaturityDispatchEnginePanel(state: state),
         InfoBanner(
           title: state.maturityCronRan
               ? 'Daily maturity cron active'
@@ -9967,13 +14222,13 @@ class _FinanceLedgerPageState extends State<FinanceLedgerPage> {
                     dataRowMinHeight: 66,
                     dataRowMaxHeight: 82,
                     headingRowColor: const WidgetStatePropertyAll(
-                      AppColors.surfaceSoft,
+                      AppColors.navy,
                     ),
                     headingTextStyle: const TextStyle(
                       fontSize: 9,
                       fontWeight: FontWeight.w900,
                       letterSpacing: 0.8,
-                      color: AppColors.muted,
+                      color: Colors.white,
                     ),
                     dataTextStyle: const TextStyle(
                       fontSize: 11,
@@ -9994,8 +14249,11 @@ class _FinanceLedgerPageState extends State<FinanceLedgerPage> {
                       DataColumn(label: Text('STATUS')),
                       DataColumn(label: Text('e-NOC / UPDATED')),
                     ],
-                    rows: records.map((record) {
+                    rows: records.asMap().entries.map((entry) {
+                      final rowIndex = entry.key;
+                      final record = entry.value;
                       return DataRow(
+                        color: portalRowColor(rowIndex),
                         onSelectChanged: (_) =>
                             showTrackerDialog(context, record),
                         cells: [
@@ -12566,12 +16824,14 @@ class _AuditLogCard extends StatelessWidget {
                     headingRowHeight: 42,
                     dataRowMinHeight: 46,
                     dataRowMaxHeight: 62,
-                    headingRowColor: const WidgetStatePropertyAll(Colors.white),
+                    headingRowColor: const WidgetStatePropertyAll(
+                      AppColors.navy,
+                    ),
                     headingTextStyle: const TextStyle(
                       fontSize: 8.4,
                       fontWeight: FontWeight.w900,
                       letterSpacing: 0.8,
-                      color: AppColors.muted,
+                      color: Colors.white,
                     ),
                     dividerThickness: 1,
                     border: const TableBorder(
@@ -12585,8 +16845,9 @@ class _AuditLogCard extends StatelessWidget {
                       DataColumn(label: Text('IP / HASH')),
                     ],
                     rows: [
-                      for (final entry in entries.take(30))
+                      for (final (rowIndex, entry) in entries.take(30).indexed)
                         DataRow(
+                          color: portalRowColor(rowIndex),
                           cells: [
                             DataCell(
                               Text(
@@ -12718,14 +16979,12 @@ class _EnocRegistryCard extends StatelessWidget {
                 headingRowHeight: 44,
                 dataRowMinHeight: 58,
                 dataRowMaxHeight: 66,
-                headingRowColor: const WidgetStatePropertyAll(
-                  AppColors.surfaceSoft,
-                ),
+                headingRowColor: const WidgetStatePropertyAll(AppColors.navy),
                 headingTextStyle: const TextStyle(
                   fontSize: 9,
                   fontWeight: FontWeight.w900,
                   letterSpacing: 0.8,
-                  color: AppColors.muted,
+                  color: Colors.white,
                 ),
                 dividerThickness: 1,
                 border: const TableBorder(
@@ -12739,8 +16998,11 @@ class _EnocRegistryCard extends StatelessWidget {
                   DataColumn(label: Text('STATUS')),
                   DataColumn(label: Text('CERTIFICATE')),
                 ],
-                rows: records.map((record) {
+                rows: records.asMap().entries.map((entry) {
+                  final rowIndex = entry.key;
+                  final record = entry.value;
                   return DataRow(
+                    color: portalRowColor(rowIndex),
                     cells: [
                       DataCell(
                         Column(
