@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -7,7 +9,7 @@ void main() {
 
 /// Global text scale so the dense dashboard typography stays readable on
 /// desktop browsers without having to zoom the page.
-const double kPortalTextScale = 1.2;
+const double kPortalTextScale = 1.4;
 
 /// Applies the portal's global text scale. Shared with widget tests so they
 /// exercise the same typography as the running app.
@@ -210,8 +212,15 @@ enum FDRStatus {
     border: Color(0xFF99F6E4),
     icon: Icons.description_rounded,
   ),
+  partialReleaseApproved(
+    label: 'Partial Release Approved',
+    fg: Color(0xFFB45309),
+    bg: Color(0xFFFFFBEB),
+    border: Color(0xFFFDE68A),
+    icon: Icons.content_cut_rounded,
+  ),
   fundsDisbursed(
-    label: 'Settled - Funds Disbursed',
+    label: 'Settled & Closed',
     fg: Color(0xFF15803D),
     bg: Color(0xFFF0FDF4),
     border: Color(0xFFBBF7D0),
@@ -232,7 +241,7 @@ enum FDRStatus {
     icon: Icons.cancel_rounded,
   ),
   forfeited(
-    label: 'Forfeited to AICTE Account',
+    label: 'Forfeited & Encashed by AICTE',
     fg: Color(0xFF7F1D1D),
     bg: Color(0xFFFEF2F2),
     border: Color(0xFFFCA5A5),
@@ -262,6 +271,7 @@ enum FDRStatus {
     FDRStatus.maturedPendingRO => 3,
     FDRStatus.roClearedPendingFinance => 4,
     FDRStatus.releasedENOC => 5,
+    FDRStatus.partialReleaseApproved => 5,
     FDRStatus.fundsDisbursed => 5,
     FDRStatus.onHoldExtension => 3,
     FDRStatus.rejectedByBank => 1,
@@ -274,6 +284,7 @@ enum FDRStatus {
     FDRStatus.maturedPendingRO => 3,
     FDRStatus.roClearedPendingFinance => 4,
     FDRStatus.releasedENOC => 4,
+    FDRStatus.partialReleaseApproved => 4,
     FDRStatus.fundsDisbursed => 4,
     FDRStatus.onHoldExtension => 3,
     FDRStatus.rejectedByBank => 1,
@@ -353,6 +364,9 @@ class FDRRecord {
     this.enocNumber,
     this.holdReason,
     this.holdDate,
+    this.renewalCount = 0,
+    this.renewedAt,
+    this.region = 'Southern',
   });
 
   final String id;
@@ -364,7 +378,7 @@ class FDRRecord {
   final int intake;
   final double amount;
   final DateTime issueDate;
-  final DateTime maturityDate;
+  DateTime maturityDate;
   FDRStatus status;
   double penalty;
   double deductedPenalty;
@@ -379,12 +393,33 @@ class FDRRecord {
   String? enocNumber;
   String? holdReason;
   DateTime? holdDate;
+  int renewalCount;
+  DateTime? renewedAt;
+  String region;
 
   bool get isMatured => !maturityDate.isAfter(DateTime.now());
+
+  bool get hasEnoc =>
+      enocNumber != null &&
+      {
+        FDRStatus.releasedENOC,
+        FDRStatus.partialReleaseApproved,
+        FDRStatus.fundsDisbursed,
+      }.contains(status);
+
+  int get daysToMaturity => maturityDate.difference(DateTime.now()).inDays;
+
+  bool get isOverdue => daysToMaturity < 0;
+
+  bool get isRenewalRequired => status == FDRStatus.onHoldExtension;
 
   double get netPayable => amount > penalty ? amount - penalty : 0;
 
   double get settlementValue => releasedAmount ?? netPayable;
+
+  double get amountCreditedToCorpus => deductedPenalty > 0
+      ? deductedPenalty
+      : (status == FDRStatus.forfeited ? amount : 0);
 
   String get complianceLabel =>
       deficiency ? 'Deficiency / Time Exceeded' : 'Zero Deficiency';
@@ -408,6 +443,34 @@ class ActivityLog {
   bool read;
 }
 
+/// Immutable security-trail entry. Every portal action appends one of these
+/// with the acting role, the affected FDR and a simulated IP / SHA reference.
+class AuditEntry {
+  AuditEntry({
+    required this.timestamp,
+    required this.actor,
+    required this.fdrId,
+    required this.action,
+    required this.ipReference,
+    required this.hashReference,
+  });
+
+  final DateTime timestamp;
+  final String actor;
+  final String fdrId;
+  final String action;
+  final String ipReference;
+  final String hashReference;
+}
+
+class StatusSlice {
+  const StatusSlice(this.label, this.count, this.color);
+
+  final String label;
+  final int count;
+  final Color color;
+}
+
 // -----------------------------------------------------------------------------
 // Centralized state controller
 // -----------------------------------------------------------------------------
@@ -422,9 +485,14 @@ class PortalState extends ChangeNotifier {
   UserRole _role = UserRole.institute;
   int _navIndex = 0;
   int _enocSequence = 4127;
+  bool maturityCronRan = false;
+  int maturityCronRuns = 0;
+  DateTime? lastCronRun;
+  bool maturityAlertDismissed = false;
 
   final List<FDRRecord> records = [];
   final List<ActivityLog> activities = [];
+  final List<AuditEntry> auditLog = [];
 
   UserRole get role => _role;
   int get navIndex => _navIndex;
@@ -503,7 +571,7 @@ class PortalState extends ChangeNotifier {
             'Release application received with all original documents. No compliance deficiency observed.',
       ),
       FDRRecord(
-        id: 'FDR-CAN-2016-412',
+        id: 'FDR-CAN-2016-414',
         bankName: 'Canara Bank',
         ifsc: 'CNRB0COIMBT',
         instituteName: 'PSG College of Technology',
@@ -520,6 +588,28 @@ class PortalState extends ChangeNotifier {
         deficiency: true,
         remarks:
             'Approval time exceeded by 47 days. Clarification on intake shortfall is pending from the institute.',
+      ),
+      FDRRecord(
+        id: 'FDR-CAN-2016-412',
+        bankName: 'Canara Bank',
+        ifsc: 'CNRB0COIMBT',
+        instituteName: 'KPR Institute of Technology',
+        instituteId: kprId,
+        program: 'B.Tech - Mechanical Engineering',
+        intake: 120,
+        amount: 2500000,
+        issueDate: DateTime(2016, 8, 5),
+        maturityDate: DateTime(2026, 8, 4),
+        status: FDRStatus.onHoldExtension,
+        lastUpdated: now.subtract(const Duration(hours: 6)),
+        submittedAt: DateTime(2016, 8, 8),
+        releaseAppliedAt: DateTime(2026, 9, 2),
+        deficiency: true,
+        holdDate: DateTime(2026, 10, 2),
+        holdReason:
+            'Project approval timeline exceeded by 47 days. Upload a renewed 2-year FDR or obtain fresh AICTE project approval before release can be considered.',
+        remarks:
+            'URGENT: FDR #FDR-CAN-2016-412 has exceeded its project/approval timeline. Immediate action required: Apply for Release or Submit 2-Year Renewal.',
       ),
       FDRRecord(
         id: 'FDR-HDFC-2016-588',
@@ -540,6 +630,89 @@ class PortalState extends ChangeNotifier {
         penalty: 300000,
         remarks:
             'RO clearance granted. ₹3,00,000 penalty assessed for delayed release submission; final approval rests with AICTE Finance.',
+      ),
+      FDRRecord(
+        id: 'FDR-SBI-2024-118',
+        bankName: 'State Bank of India',
+        ifsc: 'SBIN0004321',
+        instituteName: 'KPR Institute of Technology',
+        instituteId: kprId,
+        program: 'B.Tech - Information Technology',
+        intake: 120,
+        amount: 1500000,
+        issueDate: DateTime(2024, 3, 11),
+        maturityDate: DateTime(2026, 3, 10),
+        status: FDRStatus.releasedENOC,
+        lastUpdated: now.subtract(const Duration(hours: 20)),
+        submittedAt: DateTime(2024, 3, 12),
+        releaseAppliedAt: DateTime(2026, 8, 20),
+        roClearedAt: DateTime(2026, 9, 14),
+        releasedAt: DateTime(2026, 10, 25, 16, 40),
+        releasedAmount: 1500000,
+        enocNumber: 'AICTE/eNOC/2026/4102',
+        remarks:
+            'Released in full by AICTE Finance. Digital e-NOC issued and routed to the bank for immediate disbursement.',
+      ),
+      FDRRecord(
+        id: 'FDR-HDFC-2024-845',
+        bankName: 'HDFC Bank',
+        ifsc: 'HDFC0000125',
+        instituteName: 'Delhi Technological University',
+        instituteId: '1-510244',
+        program: 'B.Tech - Computer Engineering',
+        intake: 240,
+        amount: 3500000,
+        issueDate: DateTime(2024, 5, 6),
+        maturityDate: DateTime(2026, 5, 5),
+        status: FDRStatus.partialReleaseApproved,
+        lastUpdated: now.subtract(const Duration(days: 1, hours: 2)),
+        submittedAt: DateTime(2024, 5, 8),
+        releaseAppliedAt: DateTime(2026, 8, 2),
+        roClearedAt: DateTime(2026, 9, 9),
+        releasedAt: DateTime(2026, 10, 24, 12, 15),
+        releasedAmount: 3150000,
+        deductedPenalty: 350000,
+        penalty: 350000,
+        enocNumber: 'AICTE/eNOC/2026/4103',
+        region: 'Northern',
+        remarks:
+            'Partial release approved. ₹3,50,000 penalty deducted for delayed release filing; net ₹31,50,000 authorised via e-NOC.',
+      ),
+      FDRRecord(
+        id: 'FDR-BOB-2022-522',
+        bankName: 'Bank of Baroda',
+        ifsc: 'BARB0PUNEXX',
+        instituteName: 'College of Engineering, Pune',
+        instituteId: '1-510377',
+        program: 'B.Tech - Civil Engineering',
+        intake: 90,
+        amount: 2500000,
+        issueDate: DateTime(2022, 7, 19),
+        maturityDate: DateTime(2028, 7, 18),
+        status: FDRStatus.activeLienLocked,
+        lastUpdated: now.subtract(const Duration(days: 6)),
+        submittedAt: DateTime(2022, 7, 21),
+        region: 'Western',
+        remarks:
+            'Joint lien locked with AICTE. Deposit remains active until the approved intake cycle completes.',
+      ),
+      FDRRecord(
+        id: 'FDR-PNB-2018-733',
+        bankName: 'Punjab National Bank',
+        ifsc: 'PUNB0KOLKAT',
+        instituteName: 'Jadavpur University',
+        instituteId: '1-510512',
+        program: 'M.Tech - Power Systems',
+        intake: 36,
+        amount: 1500000,
+        issueDate: DateTime(2018, 2, 14),
+        maturityDate: DateTime(2026, 2, 13),
+        status: FDRStatus.forfeited,
+        lastUpdated: now.subtract(const Duration(days: 4)),
+        submittedAt: DateTime(2018, 2, 16),
+        region: 'Eastern',
+        remarks:
+            'Forfeited and encashed to the AICTE account after repeated non-compliance with the approval timeline.',
       ),
     ]);
 
@@ -576,6 +749,41 @@ class PortalState extends ChangeNotifier {
         color: AppColors.gold,
       ),
     ]);
+
+    auditLog.addAll([
+      AuditEntry(
+        timestamp: now.subtract(const Duration(minutes: 26)),
+        actor: 'Finance Admin • A. Sharma',
+        fdrId: 'FDR-SBI-2024-118',
+        action: 'e-NOC generated • Full release authorised',
+        ipReference: '10.24.61.18',
+        hashReference: '0x9F3A21C7',
+      ),
+      AuditEntry(
+        timestamp: now.subtract(const Duration(hours: 3)),
+        actor: 'Institute Admin • Dr. R. Kumar',
+        fdrId: 'FDR-SBI-2026-101',
+        action: 'FDR submitted for bank lien verification',
+        ipReference: '10.24.14.72',
+        hashReference: '0x41B87DE0',
+      ),
+      AuditEntry(
+        timestamp: now.subtract(const Duration(days: 1, hours: 5)),
+        actor: 'Regional Officer • R. Iyer',
+        fdrId: 'FDR-HDFC-2016-588',
+        action: 'RO clearance granted • Routed to Finance',
+        ipReference: '10.24.38.9',
+        hashReference: '0x7C2E5A91',
+      ),
+      AuditEntry(
+        timestamp: now.subtract(const Duration(days: 2)),
+        actor: 'Partner Bank • S. Menon',
+        fdrId: 'FDR-CAN-2016-412',
+        action: 'Lien re-verification flagged • Deficiency noted',
+        ipReference: '10.24.52.44',
+        hashReference: '0x2D9F0B63',
+      ),
+    ]);
   }
 
   // ---------------------------------------------------------------------------
@@ -594,7 +802,8 @@ class PortalState extends ChangeNotifier {
   List<FDRRecord> get activeLiens =>
       _withStatuses({FDRStatus.activeLienLocked});
 
-  List<FDRRecord> get releaseReady => _withStatuses({FDRStatus.releasedENOC});
+  List<FDRRecord> get releaseReady =>
+      _withStatuses({FDRStatus.releasedENOC, FDRStatus.partialReleaseApproved});
 
   List<FDRRecord> get roScrutiny => _withStatuses({FDRStatus.maturedPendingRO});
 
@@ -612,8 +821,24 @@ class PortalState extends ChangeNotifier {
 
   List<FDRRecord> get forfeitedRecords => _withStatuses({FDRStatus.forfeited});
 
-  List<FDRRecord> get releasedRecords =>
-      _withStatuses({FDRStatus.releasedENOC, FDRStatus.fundsDisbursed});
+  List<FDRRecord> get overdueRecords => records
+      .where((record) => record.isOverdue && !record.status.isClosed)
+      .toList();
+
+  List<FDRRecord> get dueSoonRecords => records.where((record) {
+    final days = record.daysToMaturity;
+    return !record.status.isClosed && days >= 0 && days <= 30;
+  }).toList();
+
+  List<FDRRecord> get maturityWatchlist => records
+      .where((record) => !record.status.isClosed && record.isMatured)
+      .toList();
+
+  List<FDRRecord> get releasedRecords => _withStatuses({
+    FDRStatus.releasedENOC,
+    FDRStatus.partialReleaseApproved,
+    FDRStatus.fundsDisbursed,
+  });
 
   List<FDRRecord> get instituteActiveDeposits => instituteRecords
       .where(
@@ -632,6 +857,7 @@ class PortalState extends ChangeNotifier {
           FDRStatus.maturedPendingRO,
           FDRStatus.roClearedPendingFinance,
           FDRStatus.releasedENOC,
+          FDRStatus.partialReleaseApproved,
           FDRStatus.onHoldExtension,
         }.contains(record.status),
       )
@@ -665,6 +891,7 @@ class PortalState extends ChangeNotifier {
           FDRStatus.maturedPendingRO,
           FDRStatus.roClearedPendingFinance,
           FDRStatus.releasedENOC,
+          FDRStatus.partialReleaseApproved,
           FDRStatus.onHoldExtension,
         }.contains(record.status),
       )
@@ -709,6 +936,81 @@ class PortalState extends ChangeNotifier {
 
   int get unreadNotifications =>
       activities.where((activity) => !activity.read).length;
+
+  // ---------------------------------------------------------------------------
+  // Phase 3 executive analytics
+  // ---------------------------------------------------------------------------
+
+  List<StatusSlice> get nationalStatusBreakdown => [
+    StatusSlice(
+      'Active Locked',
+      _withStatuses({
+        FDRStatus.pendingBankVerification,
+        FDRStatus.activeLienLocked,
+      }).length,
+      AppColors.emeraldDark,
+    ),
+    StatusSlice(
+      'Matured Pending',
+      _withStatuses({
+        FDRStatus.maturedPendingRO,
+        FDRStatus.roClearedPendingFinance,
+      }).length,
+      AppColors.gold,
+    ),
+    StatusSlice('On Hold / Extended', onHoldRecords.length, AppColors.orange),
+    StatusSlice('Released', releasedRecords.length, AppColors.teal),
+    StatusSlice('Forfeited', forfeitedRecords.length, AppColors.red),
+  ];
+
+  Map<String, double> get regionalCorpus {
+    final corpus = <String, double>{
+      'Southern': 0,
+      'Northern': 0,
+      'Western': 0,
+      'Eastern': 0,
+    };
+    for (final record in records) {
+      corpus.update(
+        record.region,
+        (value) => value + record.amount,
+        ifAbsent: () => record.amount,
+      );
+    }
+    return corpus;
+  }
+
+  double get maxRegionalCorpus {
+    final values = regionalCorpus.values;
+    if (values.isEmpty) return 0;
+    return values.reduce((a, b) => a > b ? a : b);
+  }
+
+  List<FDRRecord> get issuedEnocs =>
+      records.where((record) => record.hasEnoc).toList();
+
+  List<FDRRecord> get specialPurposeEnocs => records
+      .where(
+        (record) =>
+            record.status == FDRStatus.releasedENOC ||
+            record.status == FDRStatus.partialReleaseApproved,
+      )
+      .toList();
+
+  int get auditEventCount => auditLog.length;
+
+  void logAiConsultation(String prompt) {
+    final trimmed = prompt.trim();
+    if (trimmed.isEmpty) return;
+    _log(
+      title: 'e-Kosh AI consulted',
+      detail:
+          'RAG assistant answered: "${trimmed.length > 90 ? '${trimmed.substring(0, 90)}…' : trimmed}"',
+      icon: Icons.smart_toy_rounded,
+      color: AppColors.indigo,
+    );
+    notifyListeners();
+  }
 
   List<FDRRecord> recordsForInstitute(String instituteId) =>
       records.where((record) => record.instituteId == instituteId).toList();
@@ -910,9 +1212,9 @@ class PortalState extends ChangeNotifier {
     record.enocNumber = _nextEnoc();
     record.releasedAt = DateTime.now();
     record.lastUpdated = DateTime.now();
-    record.status = FDRStatus.releasedENOC;
+    record.status = FDRStatus.partialReleaseApproved;
     record.remarks =
-        'Partial release approved by AICTE Finance. Penalty of ${inr(safeDeduction)} deducted; net ${inr(record.releasedAmount!)} released via e-NOC ${record.enocNumber}.';
+        'Partial release approved by AICTE Finance. Penalty of ${inr(safeDeduction)} deducted; net ${inr(record.releasedAmount!)} released for bank disbursement via e-NOC ${record.enocNumber}.';
     _log(
       title: 'Partial release approved',
       detail:
@@ -928,11 +1230,11 @@ class PortalState extends ChangeNotifier {
     record.releasedAmount = 0;
     record.lastUpdated = DateTime.now();
     record.remarks =
-        'FDR encashed and forfeited to the AICTE account following final review. No funds released to the institute.';
+        'FDR fully forfeited and encashed to the AICTE account following final review. Net refund to the institute: ₹0.';
     _log(
       title: 'FDR forfeited to AICTE',
       detail:
-          '${record.id} • ${inr(record.amount)} encashed to the AICTE account.',
+          '${record.id} • ${inr(record.amount)} encashed to the AICTE account. Net refund ₹0.',
       icon: Icons.gavel_rounded,
       color: AppColors.red,
     );
@@ -946,6 +1248,57 @@ class PortalState extends ChangeNotifier {
     notifyListeners();
   }
 
+  void renewFdr(FDRRecord record, {DateTime? newMaturity}) {
+    final target =
+        newMaturity ??
+        DateTime(
+          record.maturityDate.year + 2,
+          record.maturityDate.month,
+          record.maturityDate.day,
+        );
+    record.maturityDate = target;
+    record.renewalCount += 1;
+    record.renewedAt = DateTime.now();
+    record.status = FDRStatus.pendingBankVerification;
+    record.holdReason = null;
+    record.holdDate = null;
+    record.deficiency = false;
+    record.lastUpdated = DateTime.now();
+    record.remarks =
+        'Extended / renewed FDR received from the institute. Maturity extended to ${formatDate(target)} and routed back to ${record.bankName} for fresh lien re-verification.';
+    _log(
+      title: 'Renewed FDR routed to bank',
+      detail:
+          '${record.id} extended by 2 years to ${formatDate(target)}. ${record.bankName} must re-verify the lien.',
+      icon: Icons.autorenew_rounded,
+      color: AppColors.emeraldDark,
+    );
+    notifyListeners();
+  }
+
+  void runMaturityCron() {
+    maturityCronRan = true;
+    maturityCronRuns += 1;
+    lastCronRun = DateTime.now();
+    maturityAlertDismissed = false;
+    final overdue = overdueRecords.length;
+    final dueSoon = dueSoonRecords.length;
+    _log(
+      title: 'Daily maturity cron executed',
+      detail:
+          'Cron scanned ${records.length} FDRs • $overdue overdue • $dueSoon due within 30 days. Multi-channel alerts dispatched to institute contacts.',
+      icon: Icons.schedule_send_rounded,
+      color: AppColors.orange,
+    );
+    notifyListeners();
+  }
+
+  void dismissMaturityAlert() {
+    if (maturityAlertDismissed) return;
+    maturityAlertDismissed = true;
+    notifyListeners();
+  }
+
   String _nextEnoc() => 'AICTE/eNOC/${DateTime.now().year}/${_enocSequence++}';
 
   void _log({
@@ -954,18 +1307,50 @@ class PortalState extends ChangeNotifier {
     required IconData icon,
     required Color color,
   }) {
+    final timestamp = DateTime.now();
     activities.insert(
       0,
       ActivityLog(
         title: title,
         detail: detail,
-        timestamp: DateTime.now(),
+        timestamp: timestamp,
         icon: icon,
         color: color,
       ),
     );
     if (activities.length > 40) {
       activities.removeLast();
+    }
+    _audit(title: title, detail: detail, timestamp: timestamp);
+  }
+
+  static final RegExp _auditFdrPattern = RegExp(
+    r'FDR-[A-Za-z]{2,5}-\d{4}-\d{3,6}',
+  );
+
+  void _audit({
+    required String title,
+    required String detail,
+    required DateTime timestamp,
+  }) {
+    final match = _auditFdrPattern.firstMatch('$title $detail');
+    final seed = (timestamp.millisecondsSinceEpoch ^ title.hashCode).abs();
+    final hash =
+        '0x${seed.toRadixString(16).toUpperCase().padLeft(8, '0').substring(0, 8)}';
+    final ip = '10.24.${6 + role.index * 11}.${10 + seed % 190}';
+    auditLog.insert(
+      0,
+      AuditEntry(
+        timestamp: timestamp,
+        actor: '${role.shortLabel} • ${role.personName}',
+        fdrId: match?.group(0) ?? '—',
+        action: title,
+        ipReference: ip,
+        hashReference: hash,
+      ),
+    );
+    if (auditLog.length > 120) {
+      auditLog.removeLast();
     }
   }
 }
@@ -1123,43 +1508,52 @@ class PortalShell extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: Column(
+      body: Stack(
         children: [
-          PortalTopBar(state: state),
-          Expanded(
-            child: LayoutBuilder(
-              builder: (context, constraints) {
-                final collapsed = constraints.maxWidth < 1180;
-                return Row(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    PortalSidebar(state: state, collapsed: collapsed),
-                    Expanded(
-                      child: Container(
-                        color: AppColors.slate,
-                        child: AnimatedSwitcher(
-                          duration: const Duration(milliseconds: 220),
-                          switchInCurve: Curves.easeOut,
-                          switchOutCurve: Curves.easeIn,
-                          transitionBuilder: (child, animation) {
-                            return FadeTransition(
-                              opacity: animation,
-                              child: child,
-                            );
-                          },
-                          child: KeyedSubtree(
-                            key: ValueKey(
-                              '${state.role.name}-${state.navIndex}',
+          Column(
+            children: [
+              PortalTopBar(state: state),
+              Expanded(
+                child: LayoutBuilder(
+                  builder: (context, constraints) {
+                    final collapsed = constraints.maxWidth < 1180;
+                    return Row(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        PortalSidebar(state: state, collapsed: collapsed),
+                        Expanded(
+                          child: Container(
+                            color: AppColors.slate,
+                            child: AnimatedSwitcher(
+                              duration: const Duration(milliseconds: 220),
+                              switchInCurve: Curves.easeOut,
+                              switchOutCurve: Curves.easeIn,
+                              transitionBuilder: (child, animation) {
+                                return FadeTransition(
+                                  opacity: animation,
+                                  child: child,
+                                );
+                              },
+                              child: KeyedSubtree(
+                                key: ValueKey(
+                                  '${state.role.name}-${state.navIndex}',
+                                ),
+                                child: _pageForState(context, state),
+                              ),
                             ),
-                            child: _pageForState(context, state),
                           ),
                         ),
-                      ),
-                    ),
-                  ],
-                );
-              },
-            ),
+                      ],
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+          Positioned(
+            right: 24,
+            bottom: 24,
+            child: SafeArea(child: AskEkoshAiFab(state: state)),
           ),
         ],
       ),
@@ -1181,10 +1575,11 @@ Widget _pageForState(BuildContext context, PortalState state) {
       state.navIndex == 0
           ? RoScrutinyPage(state: state)
           : RoOnHoldPage(state: state),
-    UserRole.finance =>
-      state.navIndex == 0
-          ? FinanceSettlementPage(state: state)
-          : FinanceLedgerPage(state: state),
+    UserRole.finance => switch (state.navIndex) {
+      0 => FinanceSettlementPage(state: state),
+      1 => FinanceLedgerPage(state: state),
+      _ => FinanceInsightsPage(state: state),
+    },
   };
 }
 
@@ -1244,11 +1639,15 @@ class PortalTopBar extends StatelessWidget {
                           ),
                         ),
                       ),
-                      if (width >= 1260) ...[
+                      if (width >= 1500) ...[
                         const _LiveDemoPill(),
                         const SizedBox(width: 14),
                       ],
                       _NotificationButton(state: state),
+                      if (width >= 860) ...[
+                        const SizedBox(width: 12),
+                        _CronButton(state: state),
+                      ],
                       if (!compact) ...[
                         const SizedBox(width: 12),
                         _ActiveUserBadge(state: state),
@@ -1311,7 +1710,7 @@ class _PortalBrand extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const Text(
-                  'AICTE  •  GOVERNMENT OF INDIA',
+                  'AICTE  •  GOVT OF INDIA',
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
@@ -1337,7 +1736,7 @@ class _PortalBrand extends StatelessWidget {
                 if (showSubtitle) ...[
                   const SizedBox(height: 3),
                   const Text(
-                    'Security Deposit & FDR Lifecycle Management',
+                    'Security Deposit & FDR Lifecycle',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
@@ -1457,6 +1856,77 @@ class _NotificationButton extends StatelessWidget {
   }
 }
 
+class _CronButton extends StatelessWidget {
+  const _CronButton({required this.state});
+
+  final PortalState state;
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: 'Simulate Daily Maturity Cron Job',
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: () => _simulateMaturityCron(context, state),
+        child: Container(
+          width: 46,
+          height: 46,
+          decoration: BoxDecoration(
+            color: AppColors.gold.withValues(alpha: 0.08),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: AppColors.gold.withValues(alpha: 0.28)),
+          ),
+          child: Stack(
+            clipBehavior: Clip.none,
+            alignment: Alignment.center,
+            children: [
+              const Icon(
+                Icons.schedule_send_rounded,
+                color: AppColors.gold,
+                size: 22,
+              ),
+              if (state.overdueRecords.isNotEmpty)
+                Positioned(
+                  top: 7,
+                  right: 7,
+                  child: Container(
+                    constraints: const BoxConstraints(minWidth: 16),
+                    height: 16,
+                    padding: const EdgeInsets.symmetric(horizontal: 3),
+                    decoration: BoxDecoration(
+                      color: AppColors.red,
+                      borderRadius: BorderRadius.circular(999),
+                      border: Border.all(color: Colors.white, width: 1.4),
+                    ),
+                    alignment: Alignment.center,
+                    child: Text(
+                      '${state.overdueRecords.length}',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 8.5,
+                        fontWeight: FontWeight.w900,
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+void _simulateMaturityCron(BuildContext context, PortalState state) {
+  state.runMaturityCron();
+  showAppToast(
+    context,
+    'Daily maturity cron complete • ${state.overdueRecords.length} overdue and ${state.dueSoonRecords.length} nearing maturity. Alerts sent via Portal, Email and SMS.',
+    icon: Icons.schedule_send_rounded,
+    color: AppColors.orange,
+  );
+}
+
 class _ActiveUserBadge extends StatelessWidget {
   const _ActiveUserBadge({required this.state});
 
@@ -1466,7 +1936,7 @@ class _ActiveUserBadge extends StatelessWidget {
   Widget build(BuildContext context) {
     final role = state.role;
     return Container(
-      height: 50,
+      height: 58,
       padding: const EdgeInsets.fromLTRB(7, 5, 12, 5),
       decoration: BoxDecoration(
         color: Colors.white,
@@ -1726,6 +2196,11 @@ List<PortalNavItem> _navigationFor(PortalState state) {
       const PortalNavItem(
         label: 'Master Ledger',
         icon: Icons.table_chart_rounded,
+      ),
+      PortalNavItem(
+        label: 'Analytics & Audit',
+        icon: Icons.insights_rounded,
+        badge: state.auditEventCount,
       ),
     ],
   };
@@ -2027,7 +2502,7 @@ class _SidebarFooter extends StatelessWidget {
           const SizedBox(height: 10),
           Text(
             role.org,
-            maxLines: 1,
+            maxLines: 2,
             overflow: TextOverflow.ellipsis,
             style: TextStyle(
               color: Colors.white.withValues(alpha: 0.76),
@@ -2060,7 +2535,7 @@ class _SidebarFooter extends StatelessWidget {
               const SizedBox(width: 6),
               Expanded(
                 child: Text(
-                  'SECURE SESSION • TLS 1.3',
+                  'SECURE • TLS 1.3',
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
@@ -2156,7 +2631,7 @@ class WorkspaceHeader extends StatelessWidget {
             Flexible(
               child: Text(
                 eyebrow.toUpperCase(),
-                maxLines: 1,
+                maxLines: 2,
                 overflow: TextOverflow.ellipsis,
                 style: const TextStyle(
                   fontSize: 9.2,
@@ -2199,7 +2674,7 @@ class WorkspaceHeader extends StatelessWidget {
 
     return LayoutBuilder(
       builder: (context, constraints) {
-        if (constraints.maxWidth < 850) {
+        if (constraints.maxWidth < 980) {
           return Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -2214,11 +2689,13 @@ class WorkspaceHeader extends StatelessWidget {
           children: [
             Expanded(child: titleBlock),
             const SizedBox(width: 24),
-            Wrap(
-              spacing: 10,
-              runSpacing: 10,
-              alignment: WrapAlignment.end,
-              children: actions,
+            Flexible(
+              child: Wrap(
+                spacing: 10,
+                runSpacing: 10,
+                alignment: WrapAlignment.end,
+                children: actions,
+              ),
             ),
           ],
         );
@@ -2337,7 +2814,7 @@ class KpiCard extends StatelessWidget {
           const SizedBox(height: 5),
           Text(
             helper,
-            maxLines: 2,
+            maxLines: 3,
             overflow: TextOverflow.ellipsis,
             style: const TextStyle(
               fontSize: 10.5,
@@ -2615,6 +3092,105 @@ class ComplianceBadge extends StatelessWidget {
   }
 }
 
+class MaturityUrgencyChip extends StatelessWidget {
+  const MaturityUrgencyChip({super.key, required this.record});
+
+  final FDRRecord record;
+
+  @override
+  Widget build(BuildContext context) {
+    final settled =
+        record.status == FDRStatus.fundsDisbursed ||
+        record.status == FDRStatus.forfeited ||
+        record.status == FDRStatus.rejectedByBank;
+    final days = record.daysToMaturity;
+
+    late final Color color;
+    late final Color background;
+    late final Color border;
+    late final IconData icon;
+    late final String label;
+    late final String helper;
+
+    if (settled) {
+      color = AppColors.muted;
+      background = AppColors.surfaceSoft;
+      border = AppColors.border;
+      icon = Icons.task_alt_rounded;
+      label = 'Matured • Closed';
+      helper = record.isOverdue ? '${-days}d past maturity' : 'Cycle closed';
+    } else if (days < 0) {
+      color = AppColors.red;
+      background = const Color(0xFFFEF2F2);
+      border = const Color(0xFFFECACA);
+      icon = Icons.warning_amber_rounded;
+      label = 'Time Exceeded / Overdue';
+      helper = '${-days} days overdue';
+    } else if (days < 30) {
+      color = const Color(0xFFB45309);
+      background = const Color(0xFFFFFBEB);
+      border = const Color(0xFFFDE68A);
+      icon = Icons.timer_rounded;
+      label = '< 30 Days';
+      helper = '$days days left';
+    } else if (days <= 365) {
+      color = AppColors.indigo;
+      background = const Color(0xFFEEF2FF);
+      border = const Color(0xFFC7D2FE);
+      icon = Icons.event_available_rounded;
+      label = '$days Days Left';
+      helper = 'Within one year';
+    } else {
+      color = AppColors.emeraldDark;
+      background = const Color(0xFFECFDF5);
+      border = const Color(0xFFA7F3D0);
+      icon = Icons.verified_rounded;
+      label = '> 1 Year Left';
+      helper = '${(days / 365).toStringAsFixed(1)} years';
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+      decoration: BoxDecoration(
+        color: background,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: border),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 12, color: color),
+          const SizedBox(width: 4),
+          Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 8.8,
+                  fontWeight: FontWeight.w900,
+                  color: color,
+                  height: 1.15,
+                ),
+              ),
+              Text(
+                helper,
+                style: TextStyle(
+                  fontSize: 7.6,
+                  fontWeight: FontWeight.w600,
+                  color: color.withValues(alpha: 0.75),
+                  height: 1.2,
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class BankMark extends StatelessWidget {
   const BankMark({super.key, required this.bankName, this.size = 36});
 
@@ -2858,6 +3434,7 @@ void showAppToast(
       SnackBar(
         duration: const Duration(seconds: 4),
         margin: const EdgeInsets.all(18),
+        behavior: SnackBarBehavior.floating,
         backgroundColor: color,
         content: Row(
           children: [
@@ -3282,6 +3859,154 @@ class PortalDialogFrame extends StatelessWidget {
 // Dashboard 1: Institute / College Admin
 // -----------------------------------------------------------------------------
 
+class _MaturityAlertBanner extends StatelessWidget {
+  const _MaturityAlertBanner({required this.state});
+
+  final PortalState state;
+
+  @override
+  Widget build(BuildContext context) {
+    final overdue = state.instituteRecords
+        .where((record) => record.isOverdue && !record.status.isClosed)
+        .toList();
+    if (overdue.isEmpty || state.maturityAlertDismissed) {
+      return const SizedBox.shrink();
+    }
+    final record = overdue.firstWhere(
+      (item) => item.id == 'FDR-CAN-2016-412',
+      orElse: () => overdue.first,
+    );
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 14, 10, 14),
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [Color(0xFFFEF2F2), Color(0xFFFFF7ED)],
+        ),
+        borderRadius: BorderRadius.circular(13),
+        border: Border.all(color: AppColors.red.withValues(alpha: 0.32)),
+        boxShadow: [
+          BoxShadow(
+            color: AppColors.red.withValues(alpha: 0.07),
+            blurRadius: 16,
+            offset: const Offset(0, 6),
+          ),
+        ],
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: 38,
+            height: 38,
+            decoration: BoxDecoration(
+              color: AppColors.red.withValues(alpha: 0.12),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: const Icon(
+              Icons.campaign_rounded,
+              color: AppColors.red,
+              size: 21,
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 6,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  children: [
+                    const Text(
+                      'URGENT MATURITY ALERT',
+                      style: TextStyle(
+                        fontSize: 9.2,
+                        fontWeight: FontWeight.w900,
+                        letterSpacing: 1,
+                        color: AppColors.red,
+                      ),
+                    ),
+                    SoftChip(
+                      label: state.maturityCronRan
+                          ? 'Cron alert • ${state.maturityCronRuns} run${state.maturityCronRuns == 1 ? '' : 's'}'
+                          : 'Cron monitor active',
+                      icon: Icons.schedule_send_rounded,
+                      color: AppColors.orange,
+                    ),
+                    const SoftChip(
+                      label: 'Email + SMS + Portal',
+                      icon: Icons.cell_tower_rounded,
+                      color: AppColors.red,
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  'URGENT: FDR #${record.id} has exceeded its project/approval timeline. Immediate action required: Apply for Release or Submit 2-Year Renewal.',
+                  style: const TextStyle(
+                    fontSize: 11.4,
+                    height: 1.5,
+                    fontWeight: FontWeight.w700,
+                    color: AppColors.navyInk,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  record.holdReason ??
+                      'The 8-year lock-in has ended without a completed release or renewal. Multi-channel reminders have been dispatched to the institute nodal officer.',
+                  style: const TextStyle(
+                    fontSize: 9.8,
+                    height: 1.45,
+                    color: AppColors.muted,
+                  ),
+                ),
+                const SizedBox(height: 11),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    AppButton(
+                      label: 'Apply for Release',
+                      icon: Icons.assignment_turned_in_rounded,
+                      dense: true,
+                      color: AppColors.gold,
+                      onPressed:
+                          record.status == FDRStatus.onHoldExtension ||
+                              !record.isMatured
+                          ? null
+                          : () => _applyForRelease(context, state, record),
+                    ),
+                    AppButton(
+                      label: 'Submit 2-Year Renewal',
+                      icon: Icons.autorenew_rounded,
+                      dense: true,
+                      color: AppColors.orange,
+                      onPressed: () =>
+                          openRenewalDialog(context, state, record),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          IconButton(
+            tooltip: 'Dismiss alert',
+            onPressed: state.dismissMaturityAlert,
+            icon: const Icon(
+              Icons.close_rounded,
+              size: 18,
+              color: AppColors.muted,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class InstitutePortfolioPage extends StatelessWidget {
   const InstitutePortfolioPage({super.key, required this.state});
 
@@ -3316,6 +4041,11 @@ class InstitutePortfolioPage extends StatelessWidget {
         ],
       ),
       children: [
+        if (state.instituteRecords.any(
+              (record) => record.isOverdue && !record.status.isClosed,
+            ) &&
+            !state.maturityAlertDismissed)
+          _MaturityAlertBanner(state: state),
         KpiGrid(
           cards: [
             KpiCard(
@@ -3386,14 +4116,14 @@ class InstitutePortfolioPage extends StatelessWidget {
                   ),
                 )
               : TableScroll(
-                  minWidth: 1130,
+                  minWidth: 1250,
                   child: DataTable(
                     showCheckboxColumn: false,
                     horizontalMargin: 20,
-                    columnSpacing: 22,
+                    columnSpacing: 20,
                     headingRowHeight: 46,
-                    dataRowMinHeight: 72,
-                    dataRowMaxHeight: 90,
+                    dataRowMinHeight: 78,
+                    dataRowMaxHeight: 96,
                     headingRowColor: const WidgetStatePropertyAll(
                       AppColors.surfaceSoft,
                     ),
@@ -3416,6 +4146,7 @@ class InstitutePortfolioPage extends StatelessWidget {
                       DataColumn(label: Text('PROGRAM & INTAKE')),
                       DataColumn(label: Text('DEPOSIT AMOUNT')),
                       DataColumn(label: Text('MATURITY')),
+                      DataColumn(label: Text('MATURITY URGENCY')),
                       DataColumn(label: Text('LIFECYCLE STATUS')),
                       DataColumn(label: Text('ACTION')),
                     ],
@@ -3423,6 +4154,9 @@ class InstitutePortfolioPage extends StatelessWidget {
                       final canApply =
                           record.status == FDRStatus.activeLienLocked &&
                           record.isMatured;
+                      final needsRenewal =
+                          record.status == FDRStatus.onHoldExtension;
+                      final hasEnoc = record.hasEnoc;
                       return DataRow(
                         onSelectChanged: (_) =>
                             showTrackerDialog(context, record),
@@ -3519,28 +4253,57 @@ class InstitutePortfolioPage extends StatelessWidget {
                               ],
                             ),
                           ),
+                          DataCell(MaturityUrgencyChip(record: record)),
                           DataCell(StatusPill(status: record.status)),
                           DataCell(
-                            canApply
-                                ? AppButton(
-                                    label: 'Apply for Release',
-                                    icon: Icons.assignment_turned_in_rounded,
-                                    dense: true,
-                                    color: AppColors.gold,
-                                    onPressed: () => _applyForRelease(
-                                      context,
-                                      state,
-                                      record,
+                            SizedBox(
+                              width: 280,
+                              child: hasEnoc
+                                  ? AppButton(
+                                      label: 'View / Download Digital e-NOC',
+                                      icon: Icons.qr_code_2_rounded,
+                                      dense: true,
+                                      color: AppColors.emeraldDark,
+                                      onPressed: () => showEnocDialog(
+                                        context,
+                                        state,
+                                        record,
+                                      ),
+                                    )
+                                  : needsRenewal
+                                  ? AppButton(
+                                      label:
+                                          'Upload Extended / Renewed FDR (2 Years)',
+                                      icon: Icons.autorenew_rounded,
+                                      dense: true,
+                                      color: AppColors.orange,
+                                      onPressed: () => openRenewalDialog(
+                                        context,
+                                        state,
+                                        record,
+                                      ),
+                                    )
+                                  : canApply
+                                  ? AppButton(
+                                      label: 'Apply for Release',
+                                      icon: Icons.assignment_turned_in_rounded,
+                                      dense: true,
+                                      color: AppColors.gold,
+                                      onPressed: () => _applyForRelease(
+                                        context,
+                                        state,
+                                        record,
+                                      ),
+                                    )
+                                  : AppButton(
+                                      label: 'Track lifecycle',
+                                      icon: Icons.arrow_forward_rounded,
+                                      primary: false,
+                                      dense: true,
+                                      onPressed: () =>
+                                          showTrackerDialog(context, record),
                                     ),
-                                  )
-                                : AppButton(
-                                    label: 'Track lifecycle',
-                                    icon: Icons.arrow_forward_rounded,
-                                    primary: false,
-                                    dense: true,
-                                    onPressed: () =>
-                                        showTrackerDialog(context, record),
-                                  ),
+                            ),
                           ),
                         ],
                       );
@@ -3693,6 +4456,183 @@ Future<void> _applyForRelease(
   );
 }
 
+Future<void> openRenewalDialog(
+  BuildContext context,
+  PortalState state,
+  FDRRecord record,
+) async {
+  final confirmed = await showDialog<bool>(
+    context: context,
+    barrierColor: AppColors.navyInk.withValues(alpha: 0.5),
+    builder: (context) => _RenewalDialog(record: record),
+  );
+  if (confirmed != true || !context.mounted) return;
+  state.renewFdr(record);
+  showAppToast(
+    context,
+    '${record.id} renewed to ${formatDate(record.maturityDate)} and routed to ${record.bankName} for lien re-verification.',
+    icon: Icons.autorenew_rounded,
+    color: AppColors.emeraldDark,
+  );
+}
+
+class _RenewalDialog extends StatelessWidget {
+  const _RenewalDialog({required this.record});
+
+  final FDRRecord record;
+
+  @override
+  Widget build(BuildContext context) {
+    final renewedMaturity = DateTime(
+      record.maturityDate.year + 2,
+      record.maturityDate.month,
+      record.maturityDate.day,
+    );
+    return PortalDialogFrame(
+      title: 'Upload Extended / Renewed FDR (2 Years)',
+      subtitle: '${record.id} • ${record.instituteName} • ${record.bankName}',
+      icon: '↻',
+      maxWidth: 660,
+      accent: AppColors.orange,
+      bodyPadding: const EdgeInsets.all(20),
+      actions: [
+        AppButton(
+          label: 'Cancel',
+          primary: false,
+          onPressed: () => Navigator.of(context).pop(false),
+        ),
+        AppButton(
+          label: 'Upload & Route to Bank',
+          icon: Icons.upload_file_rounded,
+          color: AppColors.orange,
+          onPressed: () => Navigator.of(context).pop(true),
+        ),
+      ],
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          InfoBanner(
+            title: 'RO-mandated renewal',
+            message:
+                'The Regional Office has withheld release because the project/approval timeline was exceeded. Upload the renewed joint FDR to extend maturity by two years and return the instrument to the bank for fresh lien verification.',
+            icon: Icons.autorenew_rounded,
+            color: AppColors.orange,
+          ),
+          const SizedBox(height: 16),
+          Container(
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: AppColors.surfaceSoft,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: AppColors.border),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'RENEWED JOINT FDR DOCUMENT',
+                  style: TextStyle(
+                    fontSize: 8.6,
+                    fontWeight: FontWeight.w900,
+                    letterSpacing: 0.8,
+                    color: AppColors.muted,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Container(
+                      width: 40,
+                      height: 40,
+                      decoration: BoxDecoration(
+                        color: AppColors.orange.withValues(alpha: 0.1),
+                        borderRadius: BorderRadius.circular(9),
+                      ),
+                      child: const Icon(
+                        Icons.picture_as_pdf_rounded,
+                        color: AppColors.orange,
+                        size: 21,
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            '${record.id}_RENEWAL_2Y.pdf',
+                            style: const TextStyle(
+                              fontSize: 10.8,
+                              fontWeight: FontWeight.w800,
+                              color: AppColors.navyInk,
+                            ),
+                          ),
+                          const SizedBox(height: 2),
+                          const Text(
+                            'Digital signature verified • Institute + AICTE Member Secretary',
+                            style: TextStyle(
+                              fontSize: 9,
+                              color: AppColors.muted,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SoftChip(
+                      label: 'Attached',
+                      icon: Icons.check_circle_rounded,
+                      color: AppColors.emeraldDark,
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 14),
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final width = constraints.maxWidth >= 480
+                  ? (constraints.maxWidth - 10) / 2
+                  : constraints.maxWidth;
+              return Wrap(
+                spacing: 10,
+                runSpacing: 10,
+                children: [
+                  SizedBox(
+                    width: width,
+                    child: _DialogAmountBox(
+                      label: 'Current maturity',
+                      value: formatDate(record.maturityDate),
+                      helper: 'Existing annual extension cycle',
+                    ),
+                  ),
+                  SizedBox(
+                    width: width,
+                    child: _DialogAmountBox(
+                      label: 'Renewed maturity (+2 years)',
+                      value: formatDate(renewedMaturity),
+                      helper: 'New 2-year lien lock-in',
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+          const SizedBox(height: 12),
+          const Text(
+            'On confirmation, the FDR status changes to "Pending Bank Verification" and the bank node receives the renewed instrument for lien re-verification.',
+            style: TextStyle(
+              fontSize: 9.6,
+              height: 1.45,
+              color: AppColors.muted,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class InstituteSubmissionPage extends StatefulWidget {
   const InstituteSubmissionPage({super.key, required this.state});
 
@@ -3734,6 +4674,13 @@ class _InstituteSubmissionPageState extends State<InstituteSubmissionPage> {
   late DateTime _issueDate;
   late DateTime _maturityDate;
 
+  bool _ocrRunning = false;
+  bool _ocrComplete = false;
+  bool _documentAttached = false;
+  double _ocrProgress = 0;
+  Timer? _ocrTimer;
+  static const _ocrConfidence = 98.4;
+
   static const _baseDeposit = 500000.0;
   static const _perSeat = 10000.0;
 
@@ -3754,12 +4701,76 @@ class _InstituteSubmissionPageState extends State<InstituteSubmissionPage> {
 
   @override
   void dispose() {
+    _ocrTimer?.cancel();
     _ifscController.dispose();
     _fdrController.dispose();
     _amountController.dispose();
     _issueController.dispose();
     _maturityController.dispose();
     super.dispose();
+  }
+
+  void _toggleDocument() {
+    if (_ocrRunning) return;
+    setState(() {
+      _documentAttached = !_documentAttached;
+      if (!_documentAttached) {
+        _ocrComplete = false;
+        _ocrProgress = 0;
+      }
+    });
+  }
+
+  void _runOcr() {
+    if (_ocrRunning) return;
+    _ocrTimer?.cancel();
+    setState(() {
+      _documentAttached = true;
+      _ocrRunning = true;
+      _ocrComplete = false;
+      _ocrProgress = 0;
+    });
+    var elapsedMs = 0;
+    _ocrTimer = Timer.periodic(const Duration(milliseconds: 30), (timer) {
+      if (!mounted) {
+        timer.cancel();
+        return;
+      }
+      elapsedMs += 30;
+      final progress = (elapsedMs / 1500).clamp(0.0, 1.0);
+      if (progress >= 1) {
+        timer.cancel();
+        _applyOcrExtraction();
+      } else {
+        setState(() => _ocrProgress = progress);
+      }
+    });
+  }
+
+  void _applyOcrExtraction() {
+    final now = DateTime.now();
+    final issue = DateTime(now.year, now.month, now.day);
+    final maturity = DateTime(now.year + 8, now.month, now.day);
+    setState(() {
+      _bank = 'State Bank of India';
+      _ifscController.text = 'SBIN0004321';
+      _fdrController.text = 'FDR-SBI-2026-88392';
+      _amountController.text = '1500000';
+      _issueDate = issue;
+      _maturityDate = maturity;
+      _issueController.text = formatDate(issue);
+      _maturityController.text = formatDate(maturity);
+      _ocrRunning = false;
+      _ocrComplete = true;
+      _ocrProgress = 1;
+      _documentAttached = true;
+    });
+    showAppToast(
+      context,
+      'AI OCR extraction complete • FDR-SBI-2026-88392 • 98.4% confidence.',
+      icon: Icons.auto_awesome_rounded,
+      color: AppColors.emeraldDark,
+    );
   }
 
   void _onBankChanged(String? bank) {
@@ -4009,6 +5020,289 @@ class _InstituteSubmissionPageState extends State<InstituteSubmissionPage> {
     );
   }
 
+  Widget _buildOcrScanner(BuildContext context) {
+    final status = _ocrProgress < 0.55
+        ? 'Scanning document via Tesseract OCR... Extracting Joint Lien Metadata...'
+        : _ocrProgress < 0.85
+        ? 'Detecting joint holder signatures and bank seal...'
+        : 'Validating AICTE Member Secretary endorsement...';
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [Color(0xFFF8FAFC), Color(0xFFEFF6FF)],
+        ),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: AppColors.indigo.withValues(alpha: 0.18)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 34,
+                height: 34,
+                decoration: BoxDecoration(
+                  color: AppColors.indigo.withValues(alpha: 0.09),
+                  borderRadius: BorderRadius.circular(9),
+                ),
+                child: const Icon(
+                  Icons.auto_awesome_rounded,
+                  size: 18,
+                  color: AppColors.indigo,
+                ),
+              ),
+              const SizedBox(width: 10),
+              const Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'AI OCR Document Scanner',
+                      style: TextStyle(
+                        fontSize: 11.8,
+                        fontWeight: FontWeight.w900,
+                        color: AppColors.navyInk,
+                      ),
+                    ),
+                    SizedBox(height: 2),
+                    Text(
+                      'Upload the scanned joint FDR and auto-fill bank metadata.',
+                      style: TextStyle(fontSize: 9.2, color: AppColors.muted),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              const SoftChip(
+                label: 'Tesseract • Simulated',
+                icon: Icons.memory_rounded,
+                color: AppColors.indigo,
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          InkWell(
+            borderRadius: BorderRadius.circular(10),
+            onTap: _toggleDocument,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 13),
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.75),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(
+                  color: _documentAttached
+                      ? AppColors.emerald.withValues(alpha: 0.38)
+                      : AppColors.border,
+                ),
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                    _documentAttached
+                        ? Icons.task_alt_rounded
+                        : Icons.cloud_upload_rounded,
+                    size: 23,
+                    color: _documentAttached
+                        ? AppColors.emeraldDark
+                        : AppColors.indigo,
+                  ),
+                  const SizedBox(width: 11),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          _documentAttached
+                              ? 'Joint_FDR_Scan_2026.pdf'
+                              : 'Drag & Drop Scanned Joint FDR (PDF/JPG)',
+                          style: const TextStyle(
+                            fontSize: 10.6,
+                            fontWeight: FontWeight.w800,
+                            color: AppColors.navyInk,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          _documentAttached
+                              ? '3 pages • 1.8 MB • Click to remove'
+                              : 'or click to browse • max 10 MB',
+                          style: const TextStyle(
+                            fontSize: 8.8,
+                            color: AppColors.muted,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  SoftChip(
+                    label: _documentAttached ? 'Attached' : 'No file',
+                    icon: _documentAttached
+                        ? Icons.check_circle_rounded
+                        : Icons.attach_file_rounded,
+                    color: _documentAttached
+                        ? AppColors.emeraldDark
+                        : AppColors.muted,
+                  ),
+                ],
+              ),
+            ),
+          ),
+          if (_ocrRunning) ...[
+            const SizedBox(height: 11),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(999),
+              child: LinearProgressIndicator(
+                value: _ocrProgress,
+                minHeight: 7,
+                backgroundColor: AppColors.indigo.withValues(alpha: 0.10),
+                valueColor: const AlwaysStoppedAnimation(AppColors.indigo),
+              ),
+            ),
+            const SizedBox(height: 6),
+            Row(
+              children: [
+                const SizedBox(
+                  width: 12,
+                  height: 12,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    valueColor: AlwaysStoppedAnimation(AppColors.indigo),
+                  ),
+                ),
+                const SizedBox(width: 7),
+                Expanded(
+                  child: Text(
+                    status,
+                    style: const TextStyle(
+                      fontSize: 9.2,
+                      fontWeight: FontWeight.w700,
+                      color: AppColors.indigo,
+                    ),
+                  ),
+                ),
+                Text(
+                  '${(_ocrProgress * 100).round()}%',
+                  style: const TextStyle(
+                    fontSize: 9.2,
+                    fontWeight: FontWeight.w900,
+                    color: AppColors.indigo,
+                  ),
+                ),
+              ],
+            ),
+          ],
+          if (_ocrComplete && !_ocrRunning) ...[
+            const SizedBox(height: 11),
+            Container(
+              padding: const EdgeInsets.all(11),
+              decoration: BoxDecoration(
+                color: const Color(0xFFECFDF5),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: const Color(0xFFA7F3D0)),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      const Icon(
+                        Icons.verified_rounded,
+                        size: 15,
+                        color: AppColors.emeraldDark,
+                      ),
+                      const SizedBox(width: 5),
+                      const Expanded(
+                        child: Text(
+                          'Extraction complete • 98.4% OCR MATCH',
+                          style: TextStyle(
+                            fontSize: 10,
+                            fontWeight: FontWeight.w900,
+                            color: AppColors.emeraldDark,
+                          ),
+                        ),
+                      ),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 7,
+                          vertical: 3,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(999),
+                          border: Border.all(
+                            color: AppColors.emerald.withValues(alpha: 0.3),
+                          ),
+                        ),
+                        child: Text(
+                          '${_ocrConfidence.toStringAsFixed(1)}% confidence',
+                          style: const TextStyle(
+                            fontSize: 8,
+                            fontWeight: FontWeight.w800,
+                            color: AppColors.emeraldDark,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 7),
+                  const Text(
+                    'Verified: Institute + AICTE Member Secretary',
+                    style: TextStyle(
+                      fontSize: 9.4,
+                      fontWeight: FontWeight.w800,
+                      color: AppColors.emeraldDark,
+                    ),
+                  ),
+                  const SizedBox(height: 7),
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: const [
+                      SoftChip(
+                        label: 'FDR-SBI-2026-88392',
+                        icon: Icons.confirmation_number_rounded,
+                        color: AppColors.navy,
+                      ),
+                      SoftChip(
+                        label: 'SBI • SBIN0004321',
+                        icon: Icons.account_balance_rounded,
+                        color: AppColors.navy,
+                      ),
+                      SoftChip(
+                        label: '₹15,00,000',
+                        icon: Icons.currency_rupee_rounded,
+                        color: AppColors.gold,
+                      ),
+                      SoftChip(
+                        label: '8-Year Maturity',
+                        icon: Icons.event_available_rounded,
+                        color: AppColors.orange,
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ],
+          const SizedBox(height: 11),
+          AppButton(
+            label: _ocrRunning
+                ? 'Scanning document via Tesseract OCR...'
+                : 'Run AI OCR Auto-Extraction',
+            icon: Icons.auto_awesome_rounded,
+            color: AppColors.indigo,
+            fullWidth: true,
+            onPressed: _ocrRunning ? null : _runOcr,
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildSubmissionForm(BuildContext context) {
     return SectionCard(
       title: 'Joint FDR Details',
@@ -4025,6 +5319,8 @@ class _InstituteSubmissionPageState extends State<InstituteSubmissionPage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
+            _buildOcrScanner(context),
+            const SizedBox(height: 16),
             LayoutBuilder(
               builder: (context, constraints) {
                 final fieldWidth = constraints.maxWidth >= 560
@@ -5785,30 +7081,33 @@ class _DigitalSeal extends StatelessWidget {
             width: 1,
           ),
         ),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(Icons.account_balance_rounded, size: 16, color: color),
-            const SizedBox(height: 1),
-            const Text(
-              'AICTE',
-              style: TextStyle(
-                fontSize: 8,
-                fontWeight: FontWeight.w900,
-                letterSpacing: 0.6,
-                color: AppColors.navyInk,
+        child: FittedBox(
+          fit: BoxFit.scaleDown,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.account_balance_rounded, size: 16, color: color),
+              const SizedBox(height: 1),
+              const Text(
+                'AICTE',
+                style: TextStyle(
+                  fontSize: 8,
+                  fontWeight: FontWeight.w900,
+                  letterSpacing: 0.6,
+                  color: AppColors.navyInk,
+                ),
               ),
-            ),
-            const Text(
-              'LIEN',
-              style: TextStyle(
-                fontSize: 6,
-                fontWeight: FontWeight.w800,
-                letterSpacing: 0.9,
-                color: AppColors.gold,
+              const Text(
+                'LIEN',
+                style: TextStyle(
+                  fontSize: 6,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 0.9,
+                  color: AppColors.gold,
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
@@ -6083,6 +7382,7 @@ class BankSettlementPage extends StatelessWidget {
                       if (index > 0) const SizedBox(height: 12),
                       BankReleaseCard(
                         record: releaseQueue[index],
+                        state: state,
                         onDisburse: () =>
                             _disburse(context, state, releaseQueue[index]),
                       ),
@@ -6207,7 +7507,7 @@ Future<void> _disburse(
     context,
     title: 'Disburse funds to institute?',
     message:
-        'The bank will transfer the approved amount against e-NOC ${record.enocNumber ?? '—'} and mark ${record.id} as settled. This action cannot be reversed.',
+        'The bank will transfer the approved amount against e-NOC ${record.enocNumber ?? '—'} and move ${record.id} to its final lifecycle state, Settled & Closed. This action cannot be reversed.',
     confirmLabel: 'Confirm Disbursement',
     confirmColor: AppColors.emeraldDark,
     icon: Icons.payments_rounded,
@@ -6222,7 +7522,7 @@ Future<void> _disburse(
   state.disburseFunds(record);
   showAppToast(
     context,
-    '${inr(record.settlementValue)} disbursed for ${record.id}. Settlement closed.',
+    '${inr(record.settlementValue)} disbursed for ${record.id}. Final lifecycle state: Settled & Closed.',
     icon: Icons.check_circle_rounded,
     color: AppColors.emeraldDark,
   );
@@ -6232,10 +7532,12 @@ class BankReleaseCard extends StatelessWidget {
   const BankReleaseCard({
     super.key,
     required this.record,
+    required this.state,
     required this.onDisburse,
   });
 
   final FDRRecord record;
+  final PortalState state;
   final VoidCallback onDisburse;
 
   @override
@@ -6256,7 +7558,7 @@ class BankReleaseCard extends StatelessWidget {
       ),
       child: LayoutBuilder(
         builder: (context, constraints) {
-          final wide = constraints.maxWidth >= 800;
+          final wide = constraints.maxWidth >= 900;
           final identity = Row(
             children: [
               BankMark(bankName: record.bankName, size: 42),
@@ -6336,11 +7638,10 @@ class BankReleaseCard extends StatelessWidget {
             ],
           );
 
-          final action = AppButton(
-            label: 'Disburse Funds to Institute',
-            icon: Icons.payments_rounded,
-            color: AppColors.emeraldDark,
-            onPressed: onDisburse,
+          final action = _BankReleaseActions(
+            record: record,
+            state: state,
+            onDisburse: onDisburse,
           );
 
           if (!wide) {
@@ -6356,12 +7657,13 @@ class BankReleaseCard extends StatelessWidget {
             );
           }
           return Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Expanded(flex: 5, child: identity),
               const SizedBox(width: 20),
               Expanded(flex: 3, child: financeSummary),
               const SizedBox(width: 18),
-              action,
+              SizedBox(width: 330, child: action),
             ],
           );
         },
@@ -6558,18 +7860,20 @@ class RoScrutinyPage extends StatelessWidget {
                                 label: 'Locked',
                               ),
                               const Spacer(),
-                              SoftChip(
-                                label: flagged
-                                    ? 'Flagged'
-                                    : '$inScrutiny in queue',
-                                icon: flagged
-                                    ? Icons.flag_rounded
-                                    : Icons.rule_folder_rounded,
-                                color: flagged
-                                    ? AppColors.red
-                                    : inScrutiny > 0
-                                    ? AppColors.gold
-                                    : AppColors.emeraldDark,
+                              Flexible(
+                                child: SoftChip(
+                                  label: flagged
+                                      ? 'Flagged'
+                                      : '$inScrutiny in queue',
+                                  icon: flagged
+                                      ? Icons.flag_rounded
+                                      : Icons.rule_folder_rounded,
+                                  color: flagged
+                                      ? AppColors.red
+                                      : inScrutiny > 0
+                                      ? AppColors.gold
+                                      : AppColors.emeraldDark,
+                                ),
                               ),
                             ],
                           ),
@@ -6613,13 +7917,13 @@ class RoScrutinyPage extends StatelessWidget {
                   color: AppColors.emerald,
                 )
               : TableScroll(
-                  minWidth: 1320,
+                  minWidth: 1420,
                   child: DataTable(
                     horizontalMargin: 20,
-                    columnSpacing: 20,
+                    columnSpacing: 18,
                     headingRowHeight: 46,
-                    dataRowMinHeight: 82,
-                    dataRowMaxHeight: 102,
+                    dataRowMinHeight: 86,
+                    dataRowMaxHeight: 110,
                     headingRowColor: const WidgetStatePropertyAll(
                       AppColors.surfaceSoft,
                     ),
@@ -6642,6 +7946,7 @@ class RoScrutinyPage extends StatelessWidget {
                       DataColumn(label: Text('FDR / BANK')),
                       DataColumn(label: Text('AMOUNT')),
                       DataColumn(label: Text('MATURITY')),
+                      DataColumn(label: Text('URGENCY')),
                       DataColumn(label: Text('COMPLIANCE STATUS')),
                       DataColumn(label: Text('RO ACTION')),
                     ],
@@ -6718,6 +8023,7 @@ class RoScrutinyPage extends StatelessWidget {
                               style: const TextStyle(fontSize: 10.5),
                             ),
                           ),
+                          DataCell(MaturityUrgencyChip(record: record)),
                           DataCell(
                             Tooltip(
                               message: record.remarks,
@@ -6732,12 +8038,15 @@ class RoScrutinyPage extends StatelessWidget {
                               runSpacing: 6,
                               children: [
                                 AppButton(
-                                  label: 'Forward to Finance',
-                                  icon: Icons.arrow_forward_rounded,
+                                  label: 'Inspect & Run Scrutiny',
+                                  icon: Icons.auto_awesome_rounded,
                                   dense: true,
                                   color: AppColors.navy,
-                                  onPressed: () =>
-                                      _forwardToFinance(context, state, record),
+                                  onPressed: () => _inspectAndRunScrutiny(
+                                    context,
+                                    state,
+                                    record,
+                                  ),
                                 ),
                                 AppButton(
                                   label: 'Put On Hold',
@@ -6794,50 +8103,6 @@ class _CoverageMetric extends StatelessWidget {
   }
 }
 
-Future<void> _forwardToFinance(
-  BuildContext context,
-  PortalState state,
-  FDRRecord record,
-) async {
-  final confirmed = await showConfirmDialog(
-    context,
-    title: 'Grant RO clearance?',
-    message:
-        '${record.id} will be forwarded to AICTE Finance with RO clearance. Finance will then decide on full release, partial release with penalty, or forfeiture.',
-    confirmLabel: 'Forward to Finance',
-    confirmColor: AppColors.navy,
-    icon: Icons.verified_rounded,
-    extra: Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        _DialogAmountBox(
-          label: 'Deposit amount',
-          value: inr(record.amount),
-          helper: '${record.instituteName}\n${record.bankName}',
-        ),
-        if (record.deficiency) ...[
-          const SizedBox(height: 10),
-          InfoBanner(
-            title: 'Deficiency flag present',
-            message:
-                'This application is flagged for time exceeded / pending inquiry. Forwarding records your decision that the flag is resolved.',
-            icon: Icons.warning_amber_rounded,
-            color: AppColors.red,
-          ),
-        ],
-      ],
-    ),
-  );
-  if (!confirmed || !context.mounted) return;
-  state.forwardToFinance(record);
-  showAppToast(
-    context,
-    'RO clearance granted for ${record.id}. Forwarded to AICTE Finance.',
-    icon: Icons.verified_rounded,
-    color: AppColors.indigo,
-  );
-}
-
 Future<void> _putOnHold(
   BuildContext context,
   PortalState state,
@@ -6863,6 +8128,369 @@ Future<void> _putOnHold(
     icon: Icons.pause_circle_rounded,
     color: AppColors.orange,
   );
+}
+
+enum RuleEngineAction { fastTrack, mandateExtension }
+
+Future<void> _inspectAndRunScrutiny(
+  BuildContext context,
+  PortalState state,
+  FDRRecord record,
+) async {
+  final action = await showDialog<RuleEngineAction>(
+    context: context,
+    barrierColor: AppColors.navyInk.withValues(alpha: 0.5),
+    builder: (context) => RuleEngineDialog(record: record),
+  );
+  if (action == null || !context.mounted) return;
+  switch (action) {
+    case RuleEngineAction.fastTrack:
+      state.forwardToFinance(record);
+      showAppToast(
+        context,
+        'Zero-deficiency verified. Fast-track RO clearance granted for ${record.id}; forwarded to AICTE Finance.',
+        icon: Icons.verified_rounded,
+        color: AppColors.emeraldDark,
+      );
+      break;
+    case RuleEngineAction.mandateExtension:
+      state.putOnHold(
+        record,
+        'Compliance and vigilance rule engine detected unresolved flags. Lock release and submit a renewed 2-year FDR before release can be reconsidered.',
+      );
+      showAppToast(
+        context,
+        'Release locked for ${record.id}. A 2-year FDR extension is now mandated.',
+        icon: Icons.lock_clock_rounded,
+        color: AppColors.orange,
+      );
+      break;
+  }
+}
+
+class RuleEngineDialog extends StatefulWidget {
+  const RuleEngineDialog({super.key, required this.record});
+
+  final FDRRecord record;
+
+  @override
+  State<RuleEngineDialog> createState() => _RuleEngineDialogState();
+}
+
+class _RuleEngineDialogState extends State<RuleEngineDialog> {
+  Timer? _timer;
+  bool _ready = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _timer = Timer(const Duration(milliseconds: 1100), () {
+      if (!mounted) return;
+      setState(() => _ready = true);
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final record = widget.record;
+    final deficient = record.deficiency;
+    final checks = <(String, String, String, IconData, Color)>[
+      (
+        'Infrastructure & Lab Compliance Check',
+        deficient ? 'FLAGGED' : 'PASS',
+        deficient
+            ? 'Lab utilisation report does not match the approved intake footprint.'
+            : 'Infrastructure and lab records match the approved programme footprint.',
+        deficient ? Icons.warning_amber_rounded : Icons.science_rounded,
+        deficient ? AppColors.red : AppColors.emeraldDark,
+      ),
+      (
+        'Faculty Salary & Grievance Check',
+        deficient ? 'FLAGGED - Pending Dues' : 'PASS',
+        deficient
+            ? 'Faculty salary ledger shows pending dues for the review period.'
+            : 'No pending faculty salary dues or unresolved grievances found.',
+        deficient ? Icons.people_alt_rounded : Icons.groups_rounded,
+        deficient ? AppColors.orange : AppColors.emeraldDark,
+      ),
+      (
+        'CBI / Court Vigilance Status',
+        'CLEAR',
+        'No active CBI inquiry or court restraint order is linked to the institute.',
+        Icons.gavel_rounded,
+        AppColors.emeraldDark,
+      ),
+      (
+        'Approval / Project Timeline Status',
+        deficient ? 'TIME EXCEEDED' : 'WITHIN LIMIT',
+        deficient
+            ? 'Project approval timeline exceeded by 47 days without a valid extension.'
+            : 'Approval and project timeline are within the permitted 8–10 year lock-in.',
+        deficient ? Icons.timer_off_rounded : Icons.event_available_rounded,
+        deficient ? AppColors.red : AppColors.emeraldDark,
+      ),
+    ];
+    final flags = checks
+        .where(
+          (check) =>
+              check.$2 != 'PASS' &&
+              check.$2 != 'CLEAR' &&
+              check.$2 != 'WITHIN LIMIT',
+        )
+        .length;
+
+    return PortalDialogFrame(
+      title: 'Automated Compliance & Vigilance Rule Engine',
+      subtitle: '${record.id} • ${record.instituteName} • ${record.bankName}',
+      icon: 'AI',
+      maxWidth: 820,
+      accent: deficient ? AppColors.red : AppColors.emeraldDark,
+      bodyPadding: const EdgeInsets.all(20),
+      actions: [
+        AppButton(
+          label: 'Cancel',
+          primary: false,
+          onPressed: () => Navigator.of(context).pop(),
+        ),
+        if (!_ready)
+          AppButton(
+            label: 'Querying AICTE databases...',
+            icon: Icons.sync_rounded,
+            color: AppColors.muted,
+            onPressed: null,
+          )
+        else ...[
+          AppButton(
+            label: 'Grant Fast-Track RO Clearance',
+            icon: Icons.rocket_launch_rounded,
+            color: AppColors.emeraldDark,
+            onPressed: deficient
+                ? null
+                : () => Navigator.of(context).pop(RuleEngineAction.fastTrack),
+          ),
+          AppButton(
+            label: 'Lock Release & Mandate 2-Year Extension',
+            icon: Icons.lock_clock_rounded,
+            color: AppColors.orange,
+            onPressed: deficient
+                ? () => Navigator.of(
+                    context,
+                  ).pop(RuleEngineAction.mandateExtension)
+                : null,
+          ),
+        ],
+      ],
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          InfoBanner(
+            title: _ready
+                ? (deficient
+                      ? 'Release cannot be granted — $flags compliance flags detected'
+                      : 'Zero-deficiency verified across all four databases')
+                : 'Running automated scrutiny across AICTE databases',
+            message: _ready
+                ? (deficient
+                      ? 'The rule engine has locked the release path. The Regional Officer may only mandate a two-year FDR extension until the flagged parameters are resolved.'
+                      : 'All four compliance checks returned clean. Fast-track RO clearance is enabled and the application can be forwarded to AICTE Finance.')
+                : 'Querying infrastructure, faculty salary, vigilance and project timeline records. This usually takes a few seconds.',
+            icon: _ready
+                ? (deficient
+                      ? Icons.report_problem_rounded
+                      : Icons.verified_user_rounded)
+                : Icons.auto_awesome_rounded,
+            color: _ready
+                ? (deficient ? AppColors.red : AppColors.emeraldDark)
+                : AppColors.indigo,
+          ),
+          const SizedBox(height: 14),
+          if (!_ready)
+            Column(
+              children: [
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(999),
+                  child: const LinearProgressIndicator(
+                    minHeight: 7,
+                    backgroundColor: Color(0xFFE2E8F0),
+                    valueColor: AlwaysStoppedAnimation(AppColors.indigo),
+                  ),
+                ),
+                const SizedBox(height: 9),
+                const Text(
+                  'Querying Infrastructure → Faculty → CBI / Court → Approval Timeline...',
+                  style: TextStyle(
+                    fontSize: 9.4,
+                    fontWeight: FontWeight.w700,
+                    color: AppColors.indigo,
+                  ),
+                ),
+              ],
+            )
+          else
+            Column(
+              children: [
+                for (var index = 0; index < checks.length; index++) ...[
+                  if (index > 0) const SizedBox(height: 8),
+                  _RuleCheckTile(
+                    label: checks[index].$1,
+                    status: checks[index].$2,
+                    detail: checks[index].$3,
+                    icon: checks[index].$4,
+                    color: checks[index].$5,
+                  ),
+                ],
+              ],
+            ),
+          const SizedBox(height: 14),
+          Container(
+            padding: const EdgeInsets.all(11),
+            decoration: BoxDecoration(
+              color: AppColors.surfaceSoft,
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: AppColors.border),
+            ),
+            child: Row(
+              children: [
+                const Icon(
+                  Icons.storage_rounded,
+                  size: 15,
+                  color: AppColors.muted,
+                ),
+                const SizedBox(width: 7),
+                const Expanded(
+                  child: Text(
+                    'Sources: AICTE e-Kosh compliance DB • UGC faculty ledger • CBI vigilance feed • Project approval registry',
+                    style: TextStyle(
+                      fontSize: 8.6,
+                      height: 1.4,
+                      color: AppColors.muted,
+                    ),
+                  ),
+                ),
+                SoftChip(
+                  label: _ready ? 'Audit sealed' : 'Querying',
+                  icon: _ready
+                      ? Icons.verified_rounded
+                      : Icons.hourglass_top_rounded,
+                  color: _ready ? AppColors.emeraldDark : AppColors.indigo,
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _RuleCheckTile extends StatelessWidget {
+  const _RuleCheckTile({
+    required this.label,
+    required this.status,
+    required this.detail,
+    required this.icon,
+    required this.color,
+  });
+
+  final String label;
+  final String status;
+  final String detail;
+  final IconData icon;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    final healthy =
+        status == 'PASS' || status == 'CLEAR' || status == 'WITHIN LIMIT';
+    return Container(
+      padding: const EdgeInsets.all(11),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.035),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: color.withValues(alpha: 0.16)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: 30,
+            height: 30,
+            decoration: BoxDecoration(
+              color: color.withValues(alpha: 0.10),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Icon(icon, size: 16, color: color),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        label,
+                        style: const TextStyle(
+                          fontSize: 10.4,
+                          fontWeight: FontWeight.w800,
+                          color: AppColors.navyInk,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 7,
+                        vertical: 3,
+                      ),
+                      decoration: BoxDecoration(
+                        color: healthy
+                            ? const Color(0xFFECFDF5)
+                            : const Color(0xFFFEF2F2),
+                        borderRadius: BorderRadius.circular(999),
+                        border: Border.all(
+                          color: healthy
+                              ? const Color(0xFFA7F3D0)
+                              : const Color(0xFFFECACA),
+                        ),
+                      ),
+                      child: Text(
+                        status,
+                        style: TextStyle(
+                          fontSize: 7.8,
+                          fontWeight: FontWeight.w900,
+                          letterSpacing: 0.4,
+                          color: healthy
+                              ? AppColors.emeraldDark
+                              : AppColors.red,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  detail,
+                  style: const TextStyle(
+                    fontSize: 8.8,
+                    height: 1.4,
+                    color: AppColors.muted,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 class RoOnHoldPage extends StatelessWidget {
@@ -7151,7 +8779,10 @@ class _OnHoldCard extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 12),
-          Row(
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            crossAxisAlignment: WrapCrossAlignment.center,
             children: [
               if (record.holdDate != null)
                 Text(
@@ -7162,7 +8793,6 @@ class _OnHoldCard extends StatelessWidget {
                     fontWeight: FontWeight.w600,
                   ),
                 ),
-              const Spacer(),
               AppButton(
                 label: 'View Tracker',
                 icon: Icons.timeline_rounded,
@@ -7170,7 +8800,6 @@ class _OnHoldCard extends StatelessWidget {
                 dense: true,
                 onPressed: onView,
               ),
-              const SizedBox(width: 8),
               AppButton(
                 label: 'Reopen Scrutiny',
                 icon: Icons.refresh_rounded,
@@ -7206,6 +8835,13 @@ class FinanceSettlementPage extends StatelessWidget {
         subtitle:
             'Approve final e-NOC releases, deduct assessed penalties, or encash an FDR to the AICTE account after regional clearance.',
         actions: [
+          AppButton(
+            label: 'Simulate Daily Maturity Cron Job',
+            icon: Icons.schedule_send_rounded,
+            primary: false,
+            color: AppColors.orange,
+            onPressed: () => _simulateMaturityCron(context, state),
+          ),
           AppButton(
             label: 'Penalty Register',
             icon: Icons.receipt_long_rounded,
@@ -7262,6 +8898,26 @@ class FinanceSettlementPage extends StatelessWidget {
           ],
         ),
         InfoBanner(
+          title: state.maturityCronRan
+              ? 'Daily maturity cron active'
+              : 'Daily maturity cron ready',
+          message:
+              '${state.overdueRecords.length} FDR${state.overdueRecords.length == 1 ? '' : 's'} overdue and ${state.dueSoonRecords.length} due within 30 days. The cron engine tracks the 8-to-10 year lock-in and dispatches portal, email and SMS alerts.${state.lastCronRun == null ? ' Run the cron simulation to refresh the watchlist.' : ' Last run ${formatDateTime(state.lastCronRun!)}.'}',
+          icon: Icons.schedule_send_rounded,
+          color: AppColors.orange,
+          trailing: SoftChip(
+            label: state.maturityCronRan
+                ? 'Cron runs: ${state.maturityCronRuns}'
+                : 'Not yet run',
+            icon: state.maturityCronRan
+                ? Icons.check_circle_rounded
+                : Icons.hourglass_top_rounded,
+            color: state.maturityCronRan
+                ? AppColors.emeraldDark
+                : AppColors.orange,
+          ),
+        ),
+        InfoBanner(
           title: 'Final approval authority',
           message:
               'Finance approval generates a digitally verifiable e-NOC and routes the net settlement to the bank. Full release waives any assessed penalty; partial release deducts the confirmed amount; forfeiture closes the deposit without institute payment.',
@@ -7313,6 +8969,7 @@ class FinanceSettlementPage extends StatelessWidget {
                   ],
                 ),
         ),
+        _EnocRegistryCard(state: state),
         SectionCard(
           title: 'Settlement Controls & Guardrails',
           subtitle:
@@ -7572,16 +9229,15 @@ class FinanceSettlementCard extends StatelessWidget {
                           onPressed: onFullRelease,
                         ),
                         AppButton(
-                          label: 'Approve Partial Release',
-                          icon: Icons.content_cut_rounded,
+                          label: 'Process Settlement & Deduct Penalty',
+                          icon: Icons.calculate_rounded,
                           dense: true,
                           color: AppColors.gold,
                           onPressed: onPartialRelease,
                         ),
                         AppButton(
-                          label: 'Forfeit & Encash FDR',
+                          label: 'Execute Full Forfeiture (Encash to AICTE)',
                           icon: Icons.gavel_rounded,
-                          primary: false,
                           dense: true,
                           color: AppColors.red,
                           onPressed: onForfeit,
@@ -7763,23 +9419,34 @@ Future<void> _forfeitFdr(
 ) async {
   final confirmed = await showConfirmDialog(
     context,
-    title: 'Forfeit and encash this FDR?',
+    title: 'Execute full forfeiture?',
     message:
-        '${record.id} will be encashed to the AICTE account. No funds will be released to ${record.instituteName}. This closes the FDR lifecycle and cannot be undone.',
-    confirmLabel: 'Forfeit FDR',
+        '${record.id} will be fully encashed to the AICTE account. No funds will be released to ${record.instituteName}. This closes the FDR lifecycle and cannot be undone.',
+    confirmLabel: 'Execute Full Forfeiture',
     confirmColor: AppColors.red,
     icon: Icons.gavel_rounded,
-    extra: _DialogAmountBox(
-      label: 'Amount to be forfeited',
-      value: inr(record.amount),
-      helper: '${record.instituteName}\nAICTE Finance Bureau',
+    extra: Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _DialogAmountBox(
+          label: 'Amount to be forfeited',
+          value: inr(record.amount),
+          helper: '${record.instituteName}\nAICTE Finance Bureau',
+        ),
+        const SizedBox(height: 10),
+        _DialogAmountBox(
+          label: 'Net refund to institute',
+          value: inr(0),
+          helper: 'Full forfeiture • ₹0 refundable',
+        ),
+      ],
     ),
   );
   if (!confirmed || !context.mounted) return;
   state.forfeitFdr(record);
   showAppToast(
     context,
-    '${record.id} forfeited and encashed to the AICTE account.',
+    '${record.id} forfeited and encashed to the AICTE account. Net refund: ₹0.',
     icon: Icons.gavel_rounded,
     color: AppColors.red,
   );
@@ -7822,10 +9489,11 @@ class _PartialReleaseDialogState extends State<PartialReleaseDialog> {
     final record = widget.record;
     final net = record.amount - _deduction;
     return PortalDialogFrame(
-      title: 'Approve Partial Release',
+      title: 'Settlement & Penalty Calculator',
       subtitle: '${record.id} • ${record.instituteName} • ${record.bankName}',
       icon: '₹',
-      maxWidth: 600,
+      maxWidth: 680,
+      accent: AppColors.gold,
       bodyPadding: const EdgeInsets.all(20),
       actions: [
         AppButton(
@@ -7834,8 +9502,8 @@ class _PartialReleaseDialogState extends State<PartialReleaseDialog> {
           onPressed: () => Navigator.of(context).pop(),
         ),
         AppButton(
-          label: 'Deduct & Issue e-NOC',
-          icon: Icons.description_rounded,
+          label: 'Approve Partial Release & Deduct Penalty',
+          icon: Icons.content_cut_rounded,
           color: AppColors.gold,
           onPressed: _isValid
               ? () => Navigator.of(context).pop(_deduction)
@@ -7846,20 +9514,57 @@ class _PartialReleaseDialogState extends State<PartialReleaseDialog> {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           InfoBanner(
-            title: 'Penalty deduction',
+            title: 'Dynamic penalty deduction',
             message:
-                'Confirm the amount to be deducted from the deposit before issuing the e-NOC. The net amount will be routed to the bank settlement queue.',
-            icon: Icons.content_cut_rounded,
+                'Set the liquidated damages to be deducted before issuing the e-NOC. The net refund is routed to the bank settlement queue and the deduction is credited to the AICTE corpus.',
+            icon: Icons.calculate_rounded,
             color: AppColors.gold,
           ),
-          const SizedBox(height: 16),
+          const SizedBox(height: 15),
           _DialogAmountBox(
-            label: 'Gross deposit',
+            label: 'Original deposit amount',
             value: inr(record.amount),
             helper:
                 '${record.instituteName}\nAssessed penalty ${inr(record.penalty)}',
           ),
           const SizedBox(height: 14),
+          Row(
+            children: [
+              const Expanded(
+                child: Text(
+                  'LIQUIDATED DAMAGES / PENALTY DEDUCTION',
+                  style: TextStyle(
+                    fontSize: 8.2,
+                    fontWeight: FontWeight.w900,
+                    letterSpacing: 0.7,
+                    color: AppColors.muted,
+                  ),
+                ),
+              ),
+              Text(
+                inr(_deduction),
+                style: const TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w900,
+                  color: AppColors.orange,
+                ),
+              ),
+            ],
+          ),
+          Slider(
+            value: _deduction.clamp(0.0, record.amount).toDouble(),
+            min: 0,
+            max: record.amount <= 0 ? 1 : record.amount,
+            divisions: 100,
+            label: inr(_deduction),
+            activeColor: AppColors.orange,
+            inactiveColor: AppColors.orange.withValues(alpha: 0.16),
+            onChanged: (value) {
+              setState(() {
+                _controller.text = value.round().toString();
+              });
+            },
+          ),
           TextField(
             controller: _controller,
             keyboardType: TextInputType.number,
@@ -7872,15 +9577,43 @@ class _PartialReleaseDialogState extends State<PartialReleaseDialog> {
               labelText: 'Penalty deduction (₹)',
               prefixIcon: const Icon(Icons.gavel_rounded, size: 18),
               suffixText: 'INR',
-              helperText: 'Assessed penalty: ${inr(record.penalty)}',
-              errorText: _deduction > record.amount
-                  ? 'Deduction cannot exceed the deposit amount'
-                  : null,
+              helperText:
+                  'Assessed penalty: ${inr(record.penalty)} • Drag the slider or type an exact amount',
             ),
           ),
           const SizedBox(height: 14),
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final width = constraints.maxWidth >= 480
+                  ? (constraints.maxWidth - 10) / 2
+                  : constraints.maxWidth;
+              return Wrap(
+                spacing: 10,
+                runSpacing: 10,
+                children: [
+                  SizedBox(
+                    width: width,
+                    child: _DialogAmountBox(
+                      label: 'Net refundable to institute',
+                      value: inr(net),
+                      helper: 'Credited to the institute settlement account',
+                    ),
+                  ),
+                  SizedBox(
+                    width: width,
+                    child: _DialogAmountBox(
+                      label: 'Amount credited to AICTE corpus',
+                      value: inr(_deduction),
+                      helper: 'Liquidated damages / penalty recovery',
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+          const SizedBox(height: 12),
           Container(
-            padding: const EdgeInsets.all(15),
+            padding: const EdgeInsets.all(13),
             decoration: BoxDecoration(
               gradient: const LinearGradient(
                 colors: [Color(0xFFECFDF5), Color(0xFFF0FDF4)],
@@ -7914,15 +9647,15 @@ class _PartialReleaseDialogState extends State<PartialReleaseDialog> {
                 ),
                 const SizedBox(height: 3),
                 Text(
-                  'Penalty deducted: ${inr(_deduction)} • e-NOC issued immediately',
+                  '${inr(record.amount)} deposit − ${inr(_deduction)} penalty = ${inr(net)} net refund',
                   style: const TextStyle(fontSize: 9.2, color: AppColors.muted),
                 ),
               ],
             ),
           ),
-          const SizedBox(height: 13),
+          const SizedBox(height: 12),
           const Text(
-            'The deduction will be recorded against the national penalty ledger and reflected in the master audit trail.',
+            'Approving this settlement sets the FDR status to "Partial Release Approved". The bank settlement desk will disburse the net refund and the deduction is recorded in the national penalty ledger.',
             style: TextStyle(fontSize: 9, color: AppColors.muted, height: 1.45),
           ),
         ],
@@ -8225,7 +9958,7 @@ class _FinanceLedgerPageState extends State<FinanceLedgerPage> {
                   color: AppColors.muted,
                 )
               : TableScroll(
-                  minWidth: 1510,
+                  minWidth: 1650,
                   child: DataTable(
                     showCheckboxColumn: false,
                     horizontalMargin: 20,
@@ -8257,6 +9990,7 @@ class _FinanceLedgerPageState extends State<FinanceLedgerPage> {
                       DataColumn(label: Text('AMOUNT')),
                       DataColumn(label: Text('PENALTY')),
                       DataColumn(label: Text('MATURITY')),
+                      DataColumn(label: Text('URGENCY')),
                       DataColumn(label: Text('STATUS')),
                       DataColumn(label: Text('e-NOC / UPDATED')),
                     ],
@@ -8354,6 +10088,7 @@ class _FinanceLedgerPageState extends State<FinanceLedgerPage> {
                               style: const TextStyle(fontSize: 9.8),
                             ),
                           ),
+                          DataCell(MaturityUrgencyChip(record: record)),
                           DataCell(StatusPill(status: record.status)),
                           DataCell(
                             Column(
@@ -8530,6 +10265,2557 @@ class _NotificationTile extends StatelessWidget {
           ),
         ],
       ),
+    );
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Phase 3: Tamper-proof digital e-NOC certificate & QR verification
+// -----------------------------------------------------------------------------
+
+/// Deterministic simulated cryptographic digest derived from the release
+/// order payload. Used by the QR widget, the certificate footer and the bank
+/// node's signature check.
+String enocVerificationHash(FDRRecord record) {
+  final source =
+      '${record.enocNumber ?? record.id}|${record.id}|'
+      '${record.amount.toStringAsFixed(0)}|${record.instituteId}|AICTE-BLOCKCHAIN';
+  var hash = 0x811C9DC5;
+  for (final unit in source.codeUnits) {
+    hash ^= unit;
+    hash = (hash * 0x01000193) & 0xFFFFFFFF;
+  }
+  final chunks = <String>[];
+  var state = hash;
+  for (var index = 0; index < 4; index++) {
+    state = (state * 1664525 + 1013904223) & 0xFFFFFFFF;
+    chunks.add(state.toRadixString(16).toUpperCase().padLeft(8, '0'));
+  }
+  return 'SHA-256 ${chunks.join(' ')}';
+}
+
+Future<void> showEnocDialog(
+  BuildContext context,
+  PortalState state,
+  FDRRecord record,
+) {
+  return showDialog<void>(
+    context: context,
+    barrierColor: AppColors.navyInk.withValues(alpha: 0.55),
+    builder: (dialogContext) => _EnocDialog(record: record),
+  );
+}
+
+class _EnocDialog extends StatefulWidget {
+  const _EnocDialog({required this.record});
+
+  final FDRRecord record;
+
+  @override
+  State<_EnocDialog> createState() => _EnocDialogState();
+}
+
+class _EnocDialogState extends State<_EnocDialog> {
+  String? _feedback;
+  bool _downloadFeedback = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final record = widget.record;
+    return PortalDialogFrame(
+      title: 'Digital No Objection Certificate (e-NOC)',
+      eyebrow: 'AICTE • Official release order',
+      subtitle:
+          'Tamper-proof authorisation generated by the AICTE Finance Bureau and anchored to the portal ledger.',
+      icon: '✓',
+      accent: AppColors.emerald,
+      maxWidth: 900,
+      bodyPadding: const EdgeInsets.all(18),
+      actions: [
+        AppButton(
+          label: 'Simulate PDF Download',
+          icon: Icons.picture_as_pdf_rounded,
+          color: AppColors.gold,
+          onPressed: () => setState(() {
+            _downloadFeedback = true;
+            _feedback =
+                'e-NOC ${record.enocNumber ?? '—'} downloaded as a digitally signed PDF (demo).';
+          }),
+        ),
+        AppButton(
+          label: 'Verify QR Hash',
+          icon: Icons.verified_user_rounded,
+          color: AppColors.emeraldDark,
+          onPressed: () => setState(() {
+            _downloadFeedback = false;
+            _feedback =
+                'QR hash verified against the AICTE blockchain registry: authentic release order for ${record.id}.';
+          }),
+        ),
+        AppButton(
+          label: 'Close',
+          primary: false,
+          onPressed: () => Navigator.of(context).pop(),
+        ),
+      ],
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _EnocCertificateBody(record: record),
+          if (_feedback != null) ...[
+            const SizedBox(height: 12),
+            _EnocActionFeedback(
+              message: _feedback!,
+              color: _downloadFeedback ? AppColors.gold : AppColors.emeraldDark,
+              icon: _downloadFeedback
+                  ? Icons.download_done_rounded
+                  : Icons.verified_rounded,
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _EnocActionFeedback extends StatelessWidget {
+  const _EnocActionFeedback({
+    required this.message,
+    required this.color,
+    required this.icon,
+  });
+
+  final String message;
+  final Color color;
+  final IconData icon;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.07),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: color.withValues(alpha: 0.32)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, size: 15, color: color),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              message,
+              style: TextStyle(
+                fontSize: 9.4,
+                fontWeight: FontWeight.w700,
+                height: 1.45,
+                color: color,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _EnocCertificateBody extends StatelessWidget {
+  const _EnocCertificateBody({required this.record});
+
+  final FDRRecord record;
+
+  @override
+  Widget build(BuildContext context) {
+    final netAmount = record.releasedAmount ?? record.netPayable;
+    final issuedAt = record.releasedAt ?? record.lastUpdated;
+    final hash = enocVerificationHash(record);
+
+    return Container(
+      decoration: BoxDecoration(
+        color: const Color(0xFFFFFDF6),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: AppColors.gold.withValues(alpha: 0.45),
+          width: 1.4,
+        ),
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(12),
+        child: Stack(
+          children: [
+            Positioned(
+              right: -26,
+              top: -18,
+              child: Icon(
+                Icons.account_balance_rounded,
+                size: 190,
+                color: AppColors.navy.withValues(alpha: 0.05),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.all(18),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Container(
+                        width: 58,
+                        height: 58,
+                        decoration: BoxDecoration(
+                          color: AppColors.navy,
+                          shape: BoxShape.circle,
+                          border: Border.all(color: AppColors.gold, width: 2),
+                        ),
+                        alignment: Alignment.center,
+                        child: const Icon(
+                          Icons.account_balance_rounded,
+                          color: AppColors.gold,
+                          size: 29,
+                        ),
+                      ),
+                      const SizedBox(width: 13),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              'ALL INDIA COUNCIL FOR TECHNICAL EDUCATION',
+                              style: TextStyle(
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.w900,
+                                letterSpacing: 0.45,
+                                color: AppColors.navyInk,
+                                height: 1.25,
+                              ),
+                            ),
+                            const SizedBox(height: 3),
+                            const Text(
+                              'DIGITAL NO OBJECTION CERTIFICATE (e-NOC)',
+                              style: TextStyle(
+                                fontSize: 9.6,
+                                fontWeight: FontWeight.w800,
+                                letterSpacing: 0.9,
+                                color: AppColors.gold,
+                              ),
+                            ),
+                            const SizedBox(height: 6),
+                            Text(
+                              'Certificate Reference: ${record.enocNumber ?? '—'}',
+                              style: const TextStyle(
+                                fontSize: 9.2,
+                                fontWeight: FontWeight.w700,
+                                color: AppColors.navyInk,
+                              ),
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              'Issued: ${formatDateTime(issuedAt)} • Statutory security-deposit release authorisation',
+                              style: const TextStyle(
+                                fontSize: 8.6,
+                                color: AppColors.muted,
+                                height: 1.4,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 14),
+                  Container(
+                    height: 2,
+                    decoration: const BoxDecoration(
+                      gradient: LinearGradient(
+                        colors: [
+                          AppColors.gold,
+                          AppColors.navy,
+                          AppColors.gold,
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  LayoutBuilder(
+                    builder: (context, constraints) {
+                      final wide = constraints.maxWidth >= 560;
+                      final width = wide
+                          ? (constraints.maxWidth - 12) / 2
+                          : constraints.maxWidth;
+                      return Wrap(
+                        spacing: 12,
+                        runSpacing: 10,
+                        children: [
+                          SizedBox(
+                            width: width,
+                            child: _EnocField(
+                              label: 'INSTITUTE NAME',
+                              value: record.instituteName,
+                            ),
+                          ),
+                          SizedBox(
+                            width: width,
+                            child: _EnocField(
+                              label: 'AICTE PERMANENT ID',
+                              value: record.instituteId,
+                            ),
+                          ),
+                          SizedBox(
+                            width: width,
+                            child: _EnocField(
+                              label: 'ISSUING BANK & IFSC',
+                              value: '${record.bankName} • ${record.ifsc}',
+                            ),
+                          ),
+                          SizedBox(
+                            width: width,
+                            child: _EnocField(
+                              label: 'FDR NUMBER',
+                              value: record.id,
+                            ),
+                          ),
+                          SizedBox(
+                            width: width,
+                            child: _EnocField(
+                              label: 'ORIGINAL PRINCIPAL AMOUNT',
+                              value: inr(record.amount),
+                            ),
+                          ),
+                          SizedBox(
+                            width: width,
+                            child: _EnocField(
+                              label: 'PENALTY DEDUCTED',
+                              value: record.deductedPenalty > 0
+                                  ? inr(record.deductedPenalty)
+                                  : 'Nil',
+                              valueColor: record.deductedPenalty > 0
+                                  ? AppColors.orange
+                                  : AppColors.emeraldDark,
+                            ),
+                          ),
+                          SizedBox(
+                            width: width,
+                            child: _EnocField(
+                              label: 'PROGRAMME',
+                              value: record.program,
+                            ),
+                          ),
+                          SizedBox(
+                            width: width,
+                            child: _EnocField(
+                              label: 'JURISDICTION',
+                              value: '${record.region} Regional Office',
+                            ),
+                          ),
+                        ],
+                      );
+                    },
+                  ),
+                  const SizedBox(height: 14),
+                  Container(
+                    padding: const EdgeInsets.fromLTRB(14, 12, 14, 13),
+                    decoration: BoxDecoration(
+                      color: AppColors.emerald.withValues(alpha: 0.09),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(
+                        color: AppColors.emerald.withValues(alpha: 0.32),
+                      ),
+                    ),
+                    child: Wrap(
+                      spacing: 12,
+                      runSpacing: 8,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      alignment: WrapAlignment.spaceBetween,
+                      children: [
+                        const Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              'NET AMOUNT AUTHORIZED FOR RELEASE TO INSTITUTE',
+                              style: TextStyle(
+                                fontSize: 8.2,
+                                fontWeight: FontWeight.w900,
+                                letterSpacing: 0.7,
+                                color: AppColors.emeraldDark,
+                              ),
+                            ),
+                            SizedBox(height: 3),
+                            Text(
+                              'After adjustment of all statutory deductions',
+                              style: TextStyle(
+                                fontSize: 8.4,
+                                color: AppColors.muted,
+                              ),
+                            ),
+                          ],
+                        ),
+                        Text(
+                          inr(netAmount),
+                          style: const TextStyle(
+                            fontSize: 20,
+                            fontWeight: FontWeight.w900,
+                            letterSpacing: -0.5,
+                            color: AppColors.emeraldDark,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  LayoutBuilder(
+                    builder: (context, constraints) {
+                      final stacked = constraints.maxWidth < 560;
+                      final qrBlock = Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          QrVerificationCode(seed: hash, size: 122),
+                          const SizedBox(height: 7),
+                          const SizedBox(
+                            width: 168,
+                            child: Text(
+                              'Scan to Verify Authenticity on AICTE Blockchain/Portal',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                fontSize: 7.8,
+                                fontWeight: FontWeight.w700,
+                                color: AppColors.muted,
+                                height: 1.35,
+                              ),
+                            ),
+                          ),
+                        ],
+                      );
+                      final verification = Container(
+                        padding: const EdgeInsets.all(13),
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
+                            color: AppColors.emerald.withValues(alpha: 0.35),
+                          ),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                Container(
+                                  width: 30,
+                                  height: 30,
+                                  decoration: BoxDecoration(
+                                    color: AppColors.emerald.withValues(
+                                      alpha: 0.12,
+                                    ),
+                                    shape: BoxShape.circle,
+                                  ),
+                                  child: const Icon(
+                                    Icons.verified_rounded,
+                                    size: 17,
+                                    color: AppColors.emeraldDark,
+                                  ),
+                                ),
+                                const SizedBox(width: 9),
+                                const Expanded(
+                                  child: Text(
+                                    'Digitally Signed by Member Secretary & Finance Bureau, AICTE HQ',
+                                    style: TextStyle(
+                                      fontSize: 9,
+                                      fontWeight: FontWeight.w800,
+                                      color: AppColors.emeraldDark,
+                                      height: 1.35,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 9),
+                            const Text(
+                              'BLOCKCHAIN ANCHOR',
+                              style: TextStyle(
+                                fontSize: 7.4,
+                                fontWeight: FontWeight.w900,
+                                letterSpacing: 0.8,
+                                color: AppColors.muted,
+                              ),
+                            ),
+                            const SizedBox(height: 3),
+                            Text(
+                              hash,
+                              style: const TextStyle(
+                                fontSize: 8,
+                                fontFamily: 'monospace',
+                                color: AppColors.navyInk,
+                                height: 1.45,
+                              ),
+                            ),
+                            const SizedBox(height: 7),
+                            Text(
+                              'Certificate ID ${record.enocNumber ?? '—'} • '
+                              'Issued ${formatDate(issuedAt)} • '
+                              'Verify at ekosh.aicte-india.org/verify',
+                              style: const TextStyle(
+                                fontSize: 8,
+                                color: AppColors.muted,
+                                height: 1.4,
+                              ),
+                            ),
+                          ],
+                        ),
+                      );
+                      if (stacked) {
+                        return Column(
+                          crossAxisAlignment: CrossAxisAlignment.center,
+                          children: [
+                            qrBlock,
+                            const SizedBox(height: 12),
+                            verification,
+                          ],
+                        );
+                      }
+                      return Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          qrBlock,
+                          const SizedBox(width: 16),
+                          Expanded(child: verification),
+                        ],
+                      );
+                    },
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _EnocField extends StatelessWidget {
+  const _EnocField({
+    required this.label,
+    required this.value,
+    this.valueColor = AppColors.navyInk,
+  });
+
+  final String label;
+  final String value;
+  final Color valueColor;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 9),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.72),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: AppColors.gold.withValues(alpha: 0.18)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            label,
+            style: const TextStyle(
+              fontSize: 7.4,
+              fontWeight: FontWeight.w900,
+              letterSpacing: 0.7,
+              color: AppColors.muted,
+            ),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            value,
+            style: TextStyle(
+              fontSize: 10.2,
+              fontWeight: FontWeight.w700,
+              color: valueColor,
+              height: 1.35,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Deterministic pseudo-QR block rendered with a custom painter. It is not a
+/// scannable QR (offline demo) but visually mirrors a high-contrast QR pattern.
+class QrVerificationCode extends StatelessWidget {
+  const QrVerificationCode({super.key, required this.seed, this.size = 120});
+
+  final String seed;
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(7),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: AppColors.navyInk, width: 1.4),
+      ),
+      child: CustomPaint(size: Size.square(size), painter: _QrPainter(seed)),
+    );
+  }
+}
+
+class _QrPainter extends CustomPainter {
+  _QrPainter(this.seed);
+
+  final String seed;
+  static const int _modules = 29;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final cell = size.width / _modules;
+    final paint = Paint()..color = AppColors.navyInk;
+    final matrix = _buildMatrix();
+
+    for (var row = 0; row < _modules; row++) {
+      for (var col = 0; col < _modules; col++) {
+        if (!matrix[row][col]) continue;
+        canvas.drawRect(
+          Rect.fromLTWH(col * cell, row * cell, cell * 0.92, cell * 0.92),
+          paint,
+        );
+      }
+    }
+  }
+
+  List<List<bool>> _buildMatrix() {
+    final matrix = List.generate(
+      _modules,
+      (_) => List<bool>.filled(_modules, false),
+    );
+    var state = 0x9E3779B9;
+    for (final unit in seed.codeUnits) {
+      state = (state ^ unit) & 0xFFFFFFFF;
+      state = (state * 1103515245 + 12345) & 0x7FFFFFFF;
+    }
+    for (var row = 0; row < _modules; row++) {
+      for (var col = 0; col < _modules; col++) {
+        state = (state * 1103515245 + 12345) & 0x7FFFFFFF;
+        matrix[row][col] = ((state >> 17) & 1) == 1;
+      }
+    }
+    // Timing patterns
+    for (var index = 8; index < _modules - 8; index++) {
+      matrix[6][index] = index.isEven;
+      matrix[index][6] = index.isEven;
+    }
+    // Finder patterns (top-left, top-right, bottom-left)
+    void finder(int row, int col) {
+      for (var r = 0; r < 7; r++) {
+        for (var c = 0; c < 7; c++) {
+          final border = r == 0 || r == 6 || c == 0 || c == 6;
+          final core = r >= 2 && r <= 4 && c >= 2 && c <= 4;
+          matrix[row + r][col + c] = border || core;
+        }
+      }
+      for (var r = -1; r <= 7; r++) {
+        for (var c = -1; c <= 7; c++) {
+          final rr = row + r;
+          final cc = col + c;
+          if (rr < 0 || rr >= _modules || cc < 0 || cc >= _modules) continue;
+          if (r == -1 || r == 7 || c == -1 || c == 7) {
+            matrix[rr][cc] = false;
+          }
+        }
+      }
+    }
+
+    finder(1, 1);
+    finder(1, _modules - 8);
+    finder(_modules - 8, 1);
+    return matrix;
+  }
+
+  @override
+  bool shouldRepaint(covariant _QrPainter oldDelegate) =>
+      oldDelegate.seed != seed;
+}
+
+Future<bool> showEnocScanDialog(BuildContext context, FDRRecord record) async {
+  final result = await showDialog<bool>(
+    context: context,
+    barrierDismissible: false,
+    barrierColor: AppColors.navyInk.withValues(alpha: 0.55),
+    builder: (dialogContext) => _EnocScanDialog(record: record),
+  );
+  return result ?? false;
+}
+
+class _EnocScanDialog extends StatefulWidget {
+  const _EnocScanDialog({required this.record});
+
+  final FDRRecord record;
+
+  @override
+  State<_EnocScanDialog> createState() => _EnocScanDialogState();
+}
+
+class _EnocScanDialogState extends State<_EnocScanDialog> {
+  Timer? _timer;
+  bool _verified = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _timer = Timer(const Duration(seconds: 1), () {
+      if (!mounted) return;
+      setState(() => _verified = true);
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final hash = enocVerificationHash(widget.record);
+    return Dialog(
+      insetPadding: const EdgeInsets.all(22),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+      backgroundColor: Colors.white,
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 470),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(22, 20, 22, 18),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                children: [
+                  Container(
+                    width: 40,
+                    height: 40,
+                    decoration: BoxDecoration(
+                      color: AppColors.navy.withValues(alpha: 0.07),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: const Icon(
+                      Icons.qr_code_scanner_rounded,
+                      color: AppColors.navy,
+                      size: 21,
+                    ),
+                  ),
+                  const SizedBox(width: 11),
+                  const Expanded(
+                    child: Text(
+                      'Bank Node QR Verification',
+                      style: TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w800,
+                        color: AppColors.navyInk,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 18),
+              AnimatedSwitcher(
+                duration: const Duration(milliseconds: 240),
+                child: _verified
+                    ? Column(
+                        key: const ValueKey('verified'),
+                        children: [
+                          Container(
+                            width: 62,
+                            height: 62,
+                            decoration: BoxDecoration(
+                              color: AppColors.emerald.withValues(alpha: 0.12),
+                              shape: BoxShape.circle,
+                            ),
+                            child: const Icon(
+                              Icons.verified_rounded,
+                              color: AppColors.emeraldDark,
+                              size: 34,
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          const Text(
+                            'e-NOC Signature Verified: Authentic AICTE Release Order',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w800,
+                              color: AppColors.emeraldDark,
+                              height: 1.4,
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            hash,
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              fontSize: 8,
+                              fontFamily: 'monospace',
+                              color: AppColors.muted,
+                              height: 1.45,
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            '${widget.record.enocNumber ?? '—'} • ${widget.record.instituteName}',
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              fontSize: 9,
+                              color: AppColors.muted,
+                              height: 1.4,
+                            ),
+                          ),
+                        ],
+                      )
+                    : Column(
+                        key: const ValueKey('scanning'),
+                        children: [
+                          const SizedBox(
+                            width: 46,
+                            height: 46,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 3.4,
+                              color: AppColors.indigo,
+                            ),
+                          ),
+                          const SizedBox(height: 14),
+                          const Text(
+                            'Decoding e-NOC QR • verifying cryptographic hash…',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w700,
+                              color: AppColors.navyInk,
+                              height: 1.45,
+                            ),
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            widget.record.enocNumber ?? '—',
+                            style: const TextStyle(
+                              fontSize: 8.6,
+                              color: AppColors.muted,
+                            ),
+                          ),
+                        ],
+                      ),
+              ),
+              const SizedBox(height: 18),
+              Wrap(
+                alignment: WrapAlignment.end,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  TextButton(
+                    onPressed: () => Navigator.of(context).pop(false),
+                    child: const Text(
+                      'Cancel',
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        color: AppColors.muted,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                  FilledButton.icon(
+                    onPressed: _verified
+                        ? () => Navigator.of(context).pop(true)
+                        : null,
+                    style: FilledButton.styleFrom(
+                      backgroundColor: AppColors.emeraldDark,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 11,
+                      ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(9),
+                      ),
+                    ),
+                    icon: const Icon(Icons.lock_open_rounded, size: 15),
+                    label: const Text(
+                      'Enable Disbursement',
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _BankReleaseActions extends StatefulWidget {
+  const _BankReleaseActions({
+    required this.record,
+    required this.state,
+    required this.onDisburse,
+  });
+
+  final FDRRecord record;
+  final PortalState state;
+  final VoidCallback onDisburse;
+
+  @override
+  State<_BankReleaseActions> createState() => _BankReleaseActionsState();
+}
+
+class _BankReleaseActionsState extends State<_BankReleaseActions> {
+  bool _verified = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        AppButton(
+          label: 'View / Download Digital e-NOC',
+          icon: Icons.qr_code_2_rounded,
+          primary: false,
+          dense: true,
+          color: AppColors.emeraldDark,
+          onPressed: () => showEnocDialog(context, widget.state, widget.record),
+        ),
+        const SizedBox(height: 9),
+        if (!_verified)
+          AppButton(
+            label: 'Scan & Verify e-NOC QR',
+            icon: Icons.qr_code_scanner_rounded,
+            color: AppColors.indigo,
+            onPressed: () async {
+              final verified = await showEnocScanDialog(context, widget.record);
+              if (!verified || !mounted || !context.mounted) return;
+              setState(() => _verified = true);
+              showAppToast(
+                context,
+                'e-NOC Signature Verified: Authentic AICTE Release Order',
+                icon: Icons.verified_user_rounded,
+                color: AppColors.emeraldDark,
+              );
+            },
+          )
+        else ...[
+          Container(
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: AppColors.emerald.withValues(alpha: 0.07),
+              borderRadius: BorderRadius.circular(9),
+              border: Border.all(
+                color: AppColors.emerald.withValues(alpha: 0.26),
+              ),
+            ),
+            child: const Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(
+                  Icons.verified_rounded,
+                  size: 15,
+                  color: AppColors.emeraldDark,
+                ),
+                SizedBox(width: 7),
+                Expanded(
+                  child: Text(
+                    'e-NOC Signature Verified: Authentic AICTE Release Order',
+                    style: TextStyle(
+                      fontSize: 8.6,
+                      fontWeight: FontWeight.w700,
+                      color: AppColors.emeraldDark,
+                      height: 1.35,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 9),
+          AppButton(
+            label: 'Release Lien & Disburse Funds to Institute Account',
+            icon: Icons.payments_rounded,
+            color: AppColors.emeraldDark,
+            onPressed: widget.onDisburse,
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Phase 3: "Ask e-Kosh AI" context-aware RAG assistant
+// -----------------------------------------------------------------------------
+
+class AskEkoshAiFab extends StatefulWidget {
+  const AskEkoshAiFab({super.key, required this.state});
+
+  final PortalState state;
+
+  @override
+  State<AskEkoshAiFab> createState() => _AskEkoshAiFabState();
+}
+
+class _AskEkoshAiFabState extends State<AskEkoshAiFab> {
+  bool _hovered = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      onEnter: (_) => setState(() => _hovered = true),
+      onExit: (_) => setState(() => _hovered = false),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 180),
+        curve: Curves.easeOut,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(30),
+          boxShadow: [
+            BoxShadow(
+              color: AppColors.indigo.withValues(alpha: _hovered ? 0.48 : 0.34),
+              blurRadius: _hovered ? 30 : 22,
+              spreadRadius: _hovered ? 5 : 2,
+              offset: const Offset(0, 8),
+            ),
+            BoxShadow(
+              color: AppColors.gold.withValues(alpha: 0.28),
+              blurRadius: 16,
+              spreadRadius: 1,
+              offset: const Offset(0, 2),
+            ),
+          ],
+        ),
+        child: Material(
+          color: Colors.transparent,
+          borderRadius: BorderRadius.circular(30),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(30),
+            onTap: () => openEkoshAiDrawer(context, widget.state),
+            child: Container(
+              padding: const EdgeInsets.fromLTRB(16, 12, 19, 12),
+              decoration: BoxDecoration(
+                gradient: const LinearGradient(
+                  colors: [AppColors.navy, AppColors.indigo],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+                borderRadius: BorderRadius.circular(30),
+                border: Border.all(
+                  color: AppColors.gold.withValues(alpha: 0.58),
+                  width: 1.2,
+                ),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    width: 30,
+                    height: 30,
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.14),
+                      shape: BoxShape.circle,
+                      border: Border.all(
+                        color: AppColors.gold.withValues(alpha: 0.55),
+                      ),
+                    ),
+                    child: const Icon(
+                      Icons.auto_awesome_rounded,
+                      size: 17,
+                      color: AppColors.gold,
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  const Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Ask e-Kosh AI',
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w900,
+                          letterSpacing: 0.25,
+                          color: Colors.white,
+                        ),
+                      ),
+                      SizedBox(height: 1),
+                      Text(
+                        'Gemini RAG • Live DB',
+                        style: TextStyle(
+                          fontSize: 7.6,
+                          fontWeight: FontWeight.w600,
+                          letterSpacing: 0.3,
+                          color: Color(0xFFC7D2FE),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(width: 9),
+                  Container(
+                    width: 6,
+                    height: 6,
+                    decoration: const BoxDecoration(
+                      color: AppColors.emerald,
+                      shape: BoxShape.circle,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+Future<void> openEkoshAiDrawer(BuildContext context, PortalState state) {
+  return showGeneralDialog<void>(
+    context: context,
+    barrierDismissible: true,
+    barrierLabel: 'Ask e-Kosh AI',
+    barrierColor: AppColors.navyInk.withValues(alpha: 0.48),
+    transitionDuration: const Duration(milliseconds: 260),
+    pageBuilder: (dialogContext, _, _) => _EkoshAiDrawer(state: state),
+    transitionBuilder: (dialogContext, animation, secondary, child) {
+      final curved = CurvedAnimation(
+        parent: animation,
+        curve: Curves.easeOutCubic,
+        reverseCurve: Curves.easeInCubic,
+      );
+      return SlideTransition(
+        position: Tween<Offset>(
+          begin: const Offset(1, 0),
+          end: Offset.zero,
+        ).animate(curved),
+        child: child,
+      );
+    },
+  );
+}
+
+class _ChatMessage {
+  _ChatMessage({
+    required this.author,
+    required this.text,
+    required this.isUser,
+    DateTime? timestamp,
+  }) : timestamp = timestamp ?? DateTime.now();
+
+  final String author;
+  final String text;
+  final bool isUser;
+  final DateTime timestamp;
+}
+
+class _EkoshAiDrawer extends StatefulWidget {
+  const _EkoshAiDrawer({required this.state});
+
+  final PortalState state;
+
+  @override
+  State<_EkoshAiDrawer> createState() => _EkoshAiDrawerState();
+}
+
+class _EkoshAiDrawerState extends State<_EkoshAiDrawer> {
+  final TextEditingController _controller = TextEditingController();
+  final ScrollController _scrollController = ScrollController();
+  final List<_ChatMessage> _messages = [];
+  bool _thinking = false;
+
+  static const _quickPrompts = <String>[
+    'Check live status of my FDRs',
+    'Calculate FDR for new Engineering College',
+    'What happens if project time exceeds limit? (Tanglish)',
+    'Show total corpus & penalty summary',
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    _messages.add(
+      _ChatMessage(
+        author: 'e-Kosh AI',
+        text:
+            'Vanakkam! I am e-Kosh AI, the AICTE security-deposit assistant. '
+            'I read the live portal database, so answers always match the '
+            'current dashboard state.\n\n'
+            'Right now I can see ${widget.state.records.length} FDR records '
+            'with a national corpus of ${inrCompact(widget.state.nationalCorpus)}. '
+            'Ask me about statuses, deposit slabs, Tanglish APH rules or the '
+            'penalty summary.',
+        isUser: false,
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  void _scrollToEnd() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_scrollController.hasClients) return;
+      _scrollController.animateTo(
+        _scrollController.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 240),
+        curve: Curves.easeOut,
+      );
+    });
+  }
+
+  Future<void> _send(String rawPrompt) async {
+    final prompt = rawPrompt.trim();
+    if (prompt.isEmpty || _thinking) return;
+    final reply = ekoshAiReply(widget.state, prompt);
+    setState(() {
+      _messages
+        ..add(
+          _ChatMessage(
+            author: widget.state.role.shortLabel,
+            text: prompt,
+            isUser: true,
+          ),
+        )
+        ..add(_ChatMessage(author: 'e-Kosh AI', text: reply, isUser: false));
+      _thinking = true;
+      _controller.clear();
+    });
+    _scrollToEnd();
+    widget.state.logAiConsultation(prompt);
+    await Future<void>.delayed(const Duration(milliseconds: 420));
+    if (!mounted) return;
+    setState(() => _thinking = false);
+    _scrollToEnd();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final screen = MediaQuery.sizeOf(context);
+    final width = screen.width < 520 ? screen.width : 468.0;
+    return Align(
+      alignment: Alignment.centerRight,
+      child: Material(
+        color: Colors.transparent,
+        child: Container(
+          width: width,
+          height: screen.height,
+          decoration: const BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.horizontal(left: Radius.circular(20)),
+            boxShadow: [
+              BoxShadow(
+                color: Color(0x330B1B43),
+                blurRadius: 40,
+                offset: Offset(-10, 0),
+              ),
+            ],
+          ),
+          child: ClipRRect(
+            borderRadius: const BorderRadius.horizontal(
+              left: Radius.circular(20),
+            ),
+            child: Column(
+              children: [
+                _buildHeader(context),
+                _buildQuickPrompts(),
+                Expanded(child: _buildTranscript()),
+                _buildComposer(context),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildHeader(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(18, 16, 12, 15),
+      decoration: const BoxDecoration(
+        gradient: LinearGradient(
+          colors: [AppColors.navyInk, AppColors.navy, AppColors.indigo],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 40,
+                height: 40,
+                decoration: BoxDecoration(
+                  color: Colors.white.withValues(alpha: 0.12),
+                  shape: BoxShape.circle,
+                  border: Border.all(
+                    color: AppColors.gold.withValues(alpha: 0.65),
+                  ),
+                ),
+                child: const Icon(
+                  Icons.smart_toy_rounded,
+                  color: AppColors.gold,
+                  size: 22,
+                ),
+              ),
+              const SizedBox(width: 11),
+              const Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'e-Kosh AI Assistant',
+                      style: TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w900,
+                        color: Colors.white,
+                      ),
+                    ),
+                    SizedBox(height: 2),
+                    Text(
+                      'Context-aware • Reads live portal DB',
+                      style: TextStyle(
+                        fontSize: 8.4,
+                        color: Color(0xFFC7D2FE),
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              IconButton(
+                onPressed: () => Navigator.of(context).pop(),
+                icon: const Icon(
+                  Icons.close_rounded,
+                  color: Colors.white,
+                  size: 20,
+                ),
+                tooltip: 'Close assistant',
+              ),
+            ],
+          ),
+          const SizedBox(height: 11),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6),
+            decoration: BoxDecoration(
+              color: AppColors.gold.withValues(alpha: 0.16),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(color: AppColors.gold.withValues(alpha: 0.45)),
+            ),
+            child: const Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.verified_rounded, size: 12, color: AppColors.gold),
+                SizedBox(width: 5),
+                Flexible(
+                  child: Text(
+                    'Supports English & Tanglish • Powered by Gemini RAG + Live DB',
+                    style: TextStyle(
+                      fontSize: 7.6,
+                      fontWeight: FontWeight.w700,
+                      color: Colors.white,
+                      height: 1.3,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildQuickPrompts() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+      decoration: const BoxDecoration(
+        color: AppColors.cream,
+        border: Border(bottom: BorderSide(color: AppColors.softBorder)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'QUICK PROMPTS',
+            style: TextStyle(
+              fontSize: 7.6,
+              fontWeight: FontWeight.w900,
+              letterSpacing: 0.8,
+              color: AppColors.muted,
+            ),
+          ),
+          const SizedBox(height: 7),
+          Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            children: _quickPrompts.map((prompt) {
+              return InkWell(
+                borderRadius: BorderRadius.circular(20),
+                onTap: () => _send(prompt),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 9,
+                    vertical: 6,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(
+                      color: AppColors.navy.withValues(alpha: 0.16),
+                    ),
+                  ),
+                  child: Text(
+                    prompt,
+                    style: const TextStyle(
+                      fontSize: 8,
+                      fontWeight: FontWeight.w700,
+                      color: AppColors.navy,
+                      height: 1.25,
+                    ),
+                  ),
+                ),
+              );
+            }).toList(),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTranscript() {
+    return Container(
+      color: AppColors.surfaceSoft,
+      child: ListView.builder(
+        controller: _scrollController,
+        padding: const EdgeInsets.fromLTRB(14, 14, 14, 16),
+        itemCount: _messages.length + (_thinking ? 1 : 0),
+        itemBuilder: (context, index) {
+          if (index >= _messages.length) {
+            return const Padding(
+              padding: EdgeInsets.symmetric(vertical: 10),
+              child: Row(
+                children: [
+                  SizedBox(
+                    width: 13,
+                    height: 13,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: AppColors.indigo,
+                    ),
+                  ),
+                  SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'e-Kosh AI is checking the live database…',
+                      style: TextStyle(
+                        fontSize: 8.6,
+                        fontStyle: FontStyle.italic,
+                        color: AppColors.muted,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            );
+          }
+          return _ChatBubble(message: _messages[index]);
+        },
+      ),
+    );
+  }
+
+  Widget _buildComposer(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
+      decoration: const BoxDecoration(
+        color: Colors.white,
+        border: Border(top: BorderSide(color: AppColors.softBorder)),
+      ),
+      child: Column(
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _controller,
+                  minLines: 1,
+                  maxLines: 3,
+                  textInputAction: TextInputAction.send,
+                  onSubmitted: _send,
+                  style: const TextStyle(
+                    fontSize: 10.2,
+                    color: AppColors.navyInk,
+                    height: 1.4,
+                  ),
+                  decoration: InputDecoration(
+                    isDense: true,
+                    hintText: 'Ask about FDRs, slabs, Tanglish APH rules…',
+                    hintStyle: const TextStyle(
+                      fontSize: 9.4,
+                      color: AppColors.muted,
+                    ),
+                    filled: true,
+                    fillColor: AppColors.surfaceSoft,
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 11,
+                    ),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(10),
+                      borderSide: const BorderSide(color: AppColors.border),
+                    ),
+                    enabledBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(10),
+                      borderSide: const BorderSide(color: AppColors.border),
+                    ),
+                    focusedBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(10),
+                      borderSide: const BorderSide(color: AppColors.navy),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Material(
+                color: AppColors.navy,
+                borderRadius: BorderRadius.circular(10),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(10),
+                  onTap: () => _send(_controller.text),
+                  child: const Padding(
+                    padding: EdgeInsets.all(11),
+                    child: Icon(
+                      Icons.send_rounded,
+                      size: 17,
+                      color: Colors.white,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          const Text(
+            'Demo RAG assistant • answers are generated from the live portal state, not an external LLM call.',
+            style: TextStyle(
+              fontSize: 7.2,
+              color: AppColors.muted,
+              height: 1.35,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ChatBubble extends StatelessWidget {
+  const _ChatBubble({required this.message});
+
+  final _ChatMessage message;
+
+  @override
+  Widget build(BuildContext context) {
+    final user = message.isUser;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 11),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisAlignment: user
+            ? MainAxisAlignment.end
+            : MainAxisAlignment.start,
+        children: [
+          if (!user) ...[
+            Container(
+              width: 26,
+              height: 26,
+              decoration: BoxDecoration(
+                gradient: const LinearGradient(
+                  colors: [AppColors.navy, AppColors.indigo],
+                ),
+                shape: BoxShape.circle,
+                border: Border.all(
+                  color: AppColors.gold.withValues(alpha: 0.5),
+                ),
+              ),
+              child: const Icon(
+                Icons.auto_awesome_rounded,
+                size: 13,
+                color: AppColors.gold,
+              ),
+            ),
+            const SizedBox(width: 7),
+          ],
+          Flexible(
+            child: Container(
+              padding: const EdgeInsets.fromLTRB(11, 9, 11, 10),
+              decoration: BoxDecoration(
+                color: user ? AppColors.navy : Colors.white,
+                borderRadius: BorderRadius.only(
+                  topLeft: const Radius.circular(12),
+                  topRight: const Radius.circular(12),
+                  bottomLeft: Radius.circular(user ? 12 : 3),
+                  bottomRight: Radius.circular(user ? 3 : 12),
+                ),
+                border: user ? null : Border.all(color: AppColors.border),
+                boxShadow: [
+                  BoxShadow(
+                    color: AppColors.navyInk.withValues(alpha: 0.04),
+                    blurRadius: 8,
+                    offset: const Offset(0, 3),
+                  ),
+                ],
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    user ? 'You • ${message.author}' : message.author,
+                    style: TextStyle(
+                      fontSize: 7.2,
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: 0.5,
+                      color: user ? const Color(0xFFBFDBFE) : AppColors.gold,
+                    ),
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    message.text,
+                    style: TextStyle(
+                      fontSize: 9.6,
+                      height: 1.55,
+                      color: user ? Colors.white : AppColors.ink,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          if (user) ...[
+            const SizedBox(width: 7),
+            Container(
+              width: 26,
+              height: 26,
+              decoration: BoxDecoration(
+                color: AppColors.slate,
+                shape: BoxShape.circle,
+                border: Border.all(color: AppColors.border),
+              ),
+              alignment: Alignment.center,
+              child: const Text(
+                'YOU',
+                style: TextStyle(
+                  fontSize: 7,
+                  fontWeight: FontWeight.w900,
+                  color: AppColors.navyInk,
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+String ekoshAiReply(PortalState state, String prompt) {
+  final query = prompt.toLowerCase();
+  final tanglish =
+      query.contains('tanglish') ||
+      query.contains('time exceed') ||
+      query.contains('exceed') ||
+      query.contains('renew') ||
+      query.contains('hold') ||
+      query.contains('enna') ||
+      query.contains('aagum') ||
+      query.contains('pannanum') ||
+      query.contains('late');
+
+  if (tanglish) {
+    return _ekoshTanglishReply(state);
+  }
+  if (query.contains('calculat') ||
+      query.contains('slab') ||
+      query.contains('new engineering') ||
+      query.contains('deposit amount') ||
+      query.contains('how much')) {
+    return _ekoshSlabReply(state);
+  }
+  if (query.contains('corpus') ||
+      query.contains('penalty') ||
+      query.contains('summary') ||
+      query.contains('finance')) {
+    return _ekoshCorpusReply(state);
+  }
+  if (query.contains('status') ||
+      query.contains('fdr') ||
+      query.contains('track') ||
+      query.contains('live')) {
+    return _ekoshStatusReply(state);
+  }
+  return _ekoshStatusReply(state);
+}
+
+String _ekoshStatusReply(PortalState state) {
+  final records = state.records;
+  if (records.isEmpty) {
+    return 'The live portal database has no FDR records yet. Submit a joint '
+        'FDR from the Institute dashboard and I will track it here in real time.';
+  }
+  final buffer = StringBuffer()
+    ..writeln(
+      'Live DB reply — ${records.length} FDRs, national corpus '
+      '${inrCompact(state.nationalCorpus)}.',
+    )
+    ..writeln();
+  for (final record in records) {
+    buffer.writeln(
+      '• ${record.id} — ${record.instituteName}\n'
+      '   Status: ${record.status.label} • ${inrCompact(record.amount)}'
+      '${record.enocNumber != null ? ' • e-NOC ${record.enocNumber}' : ''}',
+    );
+  }
+  final pending = state.financeQueue.length;
+  final enocs = state.issuedEnocs.length;
+  buffer
+    ..writeln()
+    ..write(
+      'Summary: $pending awaiting Finance approval, $enocs e-NOC(s) issued, '
+      '${state.disbursedRecords.length} settled & closed. '
+      'Institute dashboard-la e-NOC download button available for released '
+      'records.',
+    );
+  return buffer.toString();
+}
+
+String _ekoshSlabReply(PortalState state) {
+  return 'AICTE Approval Process Handbook (APH) security-deposit slabs — '
+      'joint FDR in the name of the institute and AICTE:\n\n'
+      '• ₹15,00,000 (₹15 L) — standard engineering programme band, up to '
+      '180 sanctioned intake. 10-year joint lien.\n'
+      '• ₹35,00,000 (₹35 L) — mid-size band, 181–360 sanctioned intake.\n'
+      '• ₹100,00,000 (₹1 Cr) — large band, above 360 sanctioned intake / '
+      'multi-programme campuses.\n\n'
+      'Rule: FDR principal must equal the applicable slab; maturity must cover '
+      'the full approval cycle. Current national corpus in this demo is '
+      '${inrCompact(state.nationalCorpus)} across ${state.records.length} '
+      'instruments.\n\n'
+      'Use New FDR Submission → upload receipt → Run AI OCR Auto-Extraction; '
+      'the calculator auto-fills the slab amount.';
+}
+
+String _ekoshTanglishReply(PortalState state) {
+  final onHold = state.onHoldRecords.length;
+  return 'Vanakkam! Project time limit exceed aana, AICTE APH rule prakaram '
+      'idhu nadakkum:\n\n'
+      '1. Auto-Hold — FDR udane "On Hold - Extension Required" aagum. RO '
+      'automatic-a hold podum, bank disbursement stop aagum.\n'
+      '2. 2-Year FDR Renewal — Institute 2 varsham extended / renewed FDR '
+      '(new maturity date) upload pannanum. Portal-la "Upload Extended / '
+      'Renewed FDR (2 Years)" button use pannunga.\n'
+      '3. Penalty Deduction — Delay period-ku APH slab (₹15L / ₹35L / ₹100L) '
+      'base pannitu penalty deduct aagum. Full release-la penalty waive '
+      'aagum, partial release-la deduct aagum.\n'
+      '4. Extreme non-compliance — FDR AICTE account-ku forfeit aagum '
+      '(forfeited & encashed).\n\n'
+      'Ippo live-a $onHold FDR hold-la irukku. Time exceed aana udane '
+      'renewal upload pannunga, illa na penalty + forfeiture risk irukku.';
+}
+
+String _ekoshCorpusReply(PortalState state) {
+  final regional = state.regionalCorpus.entries
+      .map((entry) => '${entry.key} ${inrCompact(entry.value)}')
+      .join(' • ');
+  return 'Finance Bureau live snapshot:\n\n'
+      '• National FDR corpus: ${inrCompact(state.nationalCorpus)} '
+      '(${inr(state.nationalCorpus)}) across ${state.records.length} FDRs.\n'
+      '• Penalties assessed: ${inr(state.totalPenaltyAssessed)}.\n'
+      '• Penalties deducted: ${inr(state.totalPenaltiesDeducted)}.\n'
+      '• Forfeited & encashed: ${inr(state.totalForfeited)}.\n'
+      '• e-NOCs issued: ${state.issuedEnocs.length} • settled & closed: '
+      '${state.disbursedRecords.length}.\n'
+      '• Audit events recorded: ${state.auditEventCount}.\n\n'
+      'Regional corpus: $regional.\n\n'
+      'Open Finance HQ → Analytics & Audit for the donut, regional bars and '
+      'the immutable audit trail.';
+}
+
+// -----------------------------------------------------------------------------
+// Phase 3: Executive analytics & immutable audit trail (Finance HQ)
+// -----------------------------------------------------------------------------
+
+class FinanceInsightsPage extends StatelessWidget {
+  const FinanceInsightsPage({super.key, required this.state});
+
+  final PortalState state;
+
+  @override
+  Widget build(BuildContext context) {
+    final slices = state.nationalStatusBreakdown;
+    final total = slices.fold<int>(0, (sum, slice) => sum + slice.count);
+    final regional = state.regionalCorpus;
+
+    return WorkspacePage(
+      header: WorkspaceHeader(
+        eyebrow: 'AICTE finance bureau • executive intelligence',
+        title: 'Executive Analytics & Immutable Audit Trail',
+        subtitle:
+            'National FDR status mix, regional corpus distribution and the tamper-evident security log that records every action performed on the portal.',
+        actions: [
+          AppButton(
+            label: 'Export Audit Extract',
+            icon: Icons.file_download_rounded,
+            primary: false,
+            onPressed: () => showAppToast(
+              context,
+              'Audit extract prepared: ${state.auditEventCount} immutable entries signed with the AICTE ledger hash (demo).',
+              icon: Icons.file_download_done_rounded,
+              color: AppColors.indigo,
+            ),
+          ),
+          AppButton(
+            label: 'Open Master Ledger',
+            icon: Icons.table_chart_rounded,
+            color: AppColors.indigo,
+            onPressed: () => state.selectNav(1),
+          ),
+        ],
+      ),
+      children: [
+        KpiGrid(
+          cards: [
+            KpiCard(
+              label: 'Records Analysed',
+              value: '$total',
+              helper: 'Across all regional offices and lifecycle states',
+              icon: Icons.dataset_rounded,
+              color: AppColors.navy,
+            ),
+            KpiCard(
+              label: 'National Corpus',
+              value: inrCompact(state.nationalCorpus),
+              helper: inr(state.nationalCorpus),
+              icon: Icons.account_balance_rounded,
+              color: AppColors.teal,
+            ),
+            KpiCard(
+              label: 'Released / Settled',
+              value:
+                  '${state.releasedRecords.length + state.disbursedRecords.length}',
+              helper:
+                  '${state.issuedEnocs.length} digital e-NOCs anchored on the ledger',
+              icon: Icons.verified_rounded,
+              color: AppColors.emeraldDark,
+            ),
+            KpiCard(
+              label: 'Audit Events',
+              value: '${state.auditEventCount}',
+              helper: 'Immutable entries — newest first',
+              icon: Icons.security_rounded,
+              color: AppColors.indigo,
+            ),
+          ],
+        ),
+        LayoutBuilder(
+          builder: (context, constraints) {
+            final wide = constraints.maxWidth >= 1080;
+            final breakdown = SectionCard(
+              title: 'National FDR Status Breakdown',
+              subtitle:
+                  'Proportion of every instrument by its current lifecycle state.',
+              trailing: SoftChip(
+                label: '$total instruments',
+                icon: Icons.donut_large_rounded,
+                color: AppColors.navy,
+              ),
+              contentPadding: const EdgeInsets.all(18),
+              child: LayoutBuilder(
+                builder: (context, inner) {
+                  final stacked = inner.maxWidth < 520;
+                  final chart = _NationalStatusDonut(
+                    slices: slices,
+                    total: total,
+                  );
+                  final legend = Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      for (var index = 0; index < slices.length; index++) ...[
+                        if (index > 0) const SizedBox(height: 9),
+                        _StatusLegendRow(slice: slices[index], total: total),
+                      ],
+                    ],
+                  );
+                  if (stacked) {
+                    return Column(
+                      children: [
+                        Center(child: chart),
+                        const SizedBox(height: 16),
+                        legend,
+                      ],
+                    );
+                  }
+                  return Row(
+                    crossAxisAlignment: CrossAxisAlignment.center,
+                    children: [
+                      chart,
+                      const SizedBox(width: 22),
+                      Expanded(child: legend),
+                    ],
+                  );
+                },
+              ),
+            );
+            final regionalCard = SectionCard(
+              title: 'Regional Corpus Distribution',
+              subtitle:
+                  'Deposit holdings compared across Southern, Northern, Western and Eastern ROs.',
+              trailing: SoftChip(
+                label: inrCompact(state.maxRegionalCorpus),
+                icon: Icons.leaderboard_rounded,
+                color: AppColors.teal,
+              ),
+              contentPadding: const EdgeInsets.all(18),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  for (var index = 0; index < regional.length; index++) ...[
+                    if (index > 0) const SizedBox(height: 15),
+                    _RegionalCorpusRow(
+                      region: regional.keys.elementAt(index),
+                      amount: regional.values.elementAt(index),
+                      maximum: state.maxRegionalCorpus,
+                      color: _regionColor(index),
+                    ),
+                  ],
+                  const SizedBox(height: 16),
+                  Container(
+                    padding: const EdgeInsets.all(11),
+                    decoration: BoxDecoration(
+                      color: AppColors.surfaceSoft,
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: AppColors.border),
+                    ),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Icon(
+                          Icons.info_outline_rounded,
+                          size: 15,
+                          color: AppColors.navy,
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            'Regional totals aggregate every FDR held under that '
+                            'Regional Office, including instruments awaiting '
+                            'release or forfeiture. Total monitored corpus: '
+                            '${inr(state.nationalCorpus)}.',
+                            style: const TextStyle(
+                              fontSize: 8.8,
+                              height: 1.45,
+                              color: AppColors.muted,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            );
+            if (!wide) {
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [breakdown, const SizedBox(height: 18), regionalCard],
+              );
+            }
+            return Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(flex: 6, child: breakdown),
+                const SizedBox(width: 18),
+                Expanded(flex: 5, child: regionalCard),
+              ],
+            );
+          },
+        ),
+        _AuditLogCard(state: state),
+      ],
+    );
+  }
+
+  Color _regionColor(int index) {
+    const palette = [
+      AppColors.navy,
+      AppColors.gold,
+      AppColors.teal,
+      AppColors.orange,
+    ];
+    return palette[index % palette.length];
+  }
+}
+
+class _NationalStatusDonut extends StatelessWidget {
+  const _NationalStatusDonut({required this.slices, required this.total});
+
+  final List<StatusSlice> slices;
+  final int total;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: 208,
+      height: 208,
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          CustomPaint(
+            size: const Size.square(208),
+            painter: _DonutPainter(slices: slices, total: total),
+          ),
+          Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                '$total',
+                style: const TextStyle(
+                  fontSize: 26,
+                  fontWeight: FontWeight.w900,
+                  letterSpacing: -0.8,
+                  color: AppColors.navyInk,
+                ),
+              ),
+              const SizedBox(height: 1),
+              const Text(
+                'FDR INSTRUMENTS',
+                style: TextStyle(
+                  fontSize: 7.4,
+                  fontWeight: FontWeight.w900,
+                  letterSpacing: 0.8,
+                  color: AppColors.muted,
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DonutPainter extends CustomPainter {
+  _DonutPainter({required this.slices, required this.total});
+
+  final List<StatusSlice> slices;
+  final int total;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final rect = Rect.fromLTWH(14, 14, size.width - 28, size.height - 28);
+    final base = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 22
+      ..color = AppColors.slate;
+    canvas.drawArc(rect, 0, 6.283185307, false, base);
+
+    if (total <= 0) return;
+    var start = -1.570796327;
+    const gap = 0.045;
+    for (final slice in slices) {
+      if (slice.count <= 0) continue;
+      final sweep = (slice.count / total) * 6.283185307;
+      final paint = Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 22
+        ..strokeCap = StrokeCap.butt
+        ..color = slice.color;
+      final drawSweep = sweep > gap ? sweep - gap : sweep;
+      canvas.drawArc(rect, start + gap / 2, drawSweep, false, paint);
+      start += sweep;
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _DonutPainter oldDelegate) =>
+      oldDelegate.total != total ||
+      oldDelegate.slices.length != slices.length ||
+      List.generate(
+        slices.length,
+        (index) => oldDelegate.slices[index].count != slices[index].count,
+      ).any((changed) => changed);
+}
+
+class _StatusLegendRow extends StatelessWidget {
+  const _StatusLegendRow({required this.slice, required this.total});
+
+  final StatusSlice slice;
+  final int total;
+
+  @override
+  Widget build(BuildContext context) {
+    final share = total == 0 ? 0.0 : (slice.count / total) * 100;
+    return Row(
+      children: [
+        Container(
+          width: 10,
+          height: 10,
+          decoration: BoxDecoration(
+            color: slice.color,
+            borderRadius: BorderRadius.circular(3),
+          ),
+        ),
+        const SizedBox(width: 9),
+        Expanded(
+          child: Text(
+            slice.label,
+            style: const TextStyle(
+              fontSize: 9.4,
+              fontWeight: FontWeight.w700,
+              color: AppColors.ink,
+            ),
+          ),
+        ),
+        Text(
+          '${slice.count}',
+          style: const TextStyle(
+            fontSize: 10.4,
+            fontWeight: FontWeight.w900,
+            color: AppColors.navyInk,
+          ),
+        ),
+        const SizedBox(width: 7),
+        SizedBox(
+          width: 52,
+          child: Text(
+            '${share.toStringAsFixed(0)}%',
+            textAlign: TextAlign.right,
+            style: const TextStyle(
+              fontSize: 8.6,
+              fontWeight: FontWeight.w700,
+              color: AppColors.muted,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _RegionalCorpusRow extends StatelessWidget {
+  const _RegionalCorpusRow({
+    required this.region,
+    required this.amount,
+    required this.maximum,
+    required this.color,
+  });
+
+  final String region;
+  final double amount;
+  final double maximum;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    final fraction = maximum <= 0 ? 0.0 : (amount / maximum).clamp(0.0, 1.0);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                '$region RO',
+                style: const TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.w800,
+                  color: AppColors.navyInk,
+                ),
+              ),
+            ),
+            Text(
+              inrCompact(amount),
+              style: const TextStyle(
+                fontSize: 10.4,
+                fontWeight: FontWeight.w900,
+                color: AppColors.navyInk,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        ClipRRect(
+          borderRadius: BorderRadius.circular(6),
+          child: Container(
+            height: 11,
+            color: AppColors.slate,
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                return Stack(
+                  children: [
+                    AnimatedContainer(
+                      duration: const Duration(milliseconds: 420),
+                      curve: Curves.easeOutCubic,
+                      width: constraints.maxWidth * fraction,
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          colors: [color, color.withValues(alpha: 0.62)],
+                        ),
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                    ),
+                  ],
+                );
+              },
+            ),
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          '${(fraction * 100).toStringAsFixed(0)}% of the largest regional holding',
+          style: const TextStyle(fontSize: 7.8, color: AppColors.muted),
+        ),
+      ],
+    );
+  }
+}
+
+class _AuditLogCard extends StatelessWidget {
+  const _AuditLogCard({required this.state});
+
+  final PortalState state;
+
+  @override
+  Widget build(BuildContext context) {
+    final entries = state.auditLog;
+    return SectionCard(
+      title: 'Immutable Security Audit Log',
+      subtitle:
+          'Chronological, append-only trail of every portal action with actor role, FDR reference, simulated IP and ledger hash.',
+      trailing: SoftChip(
+        label: '${entries.length} events • append-only',
+        icon: Icons.lock_clock_rounded,
+        color: AppColors.emeraldDark,
+      ),
+      contentPadding: entries.isEmpty
+          ? EdgeInsets.zero
+          : const EdgeInsets.only(bottom: 10),
+      child: entries.isEmpty
+          ? const EmptyState(
+              title: 'No audit events recorded',
+              message:
+                  'Perform any portal action and the immutable audit entry will appear here instantly.',
+              icon: Icons.receipt_long_rounded,
+              color: AppColors.muted,
+            )
+          : Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Container(
+                  padding: const EdgeInsets.fromLTRB(18, 12, 18, 12),
+                  color: AppColors.surfaceSoft,
+                  child: Row(
+                    children: [
+                      const Icon(
+                        Icons.verified_user_rounded,
+                        size: 15,
+                        color: AppColors.emeraldDark,
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          'Each row is hash-chained. Newest actions are '
+                          'prepended automatically — entries cannot be edited '
+                          'or deleted from the UI.',
+                          style: const TextStyle(
+                            fontSize: 8.6,
+                            height: 1.4,
+                            color: AppColors.muted,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                TableScroll(
+                  minWidth: 1120,
+                  child: DataTable(
+                    horizontalMargin: 18,
+                    columnSpacing: 22,
+                    headingRowHeight: 42,
+                    dataRowMinHeight: 46,
+                    dataRowMaxHeight: 62,
+                    headingRowColor: const WidgetStatePropertyAll(Colors.white),
+                    headingTextStyle: const TextStyle(
+                      fontSize: 8.4,
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: 0.8,
+                      color: AppColors.muted,
+                    ),
+                    dividerThickness: 1,
+                    border: const TableBorder(
+                      horizontalInside: BorderSide(color: AppColors.softBorder),
+                    ),
+                    columns: const [
+                      DataColumn(label: Text('TIMESTAMP')),
+                      DataColumn(label: Text('ACTOR ROLE')),
+                      DataColumn(label: Text('FDR ID')),
+                      DataColumn(label: Text('ACTION TAKEN')),
+                      DataColumn(label: Text('IP / HASH')),
+                    ],
+                    rows: [
+                      for (final entry in entries.take(30))
+                        DataRow(
+                          cells: [
+                            DataCell(
+                              Text(
+                                formatDateTime(entry.timestamp),
+                                style: const TextStyle(
+                                  fontSize: 8.8,
+                                  fontWeight: FontWeight.w600,
+                                  color: AppColors.ink,
+                                ),
+                              ),
+                            ),
+                            DataCell(
+                              Text(
+                                entry.actor,
+                                style: const TextStyle(
+                                  fontSize: 8.8,
+                                  color: AppColors.muted,
+                                ),
+                              ),
+                            ),
+                            DataCell(
+                              Text(
+                                entry.fdrId,
+                                style: const TextStyle(
+                                  fontSize: 9,
+                                  fontWeight: FontWeight.w800,
+                                  color: AppColors.navy,
+                                ),
+                              ),
+                            ),
+                            DataCell(
+                              SizedBox(
+                                width: 300,
+                                child: Text(
+                                  entry.action,
+                                  style: const TextStyle(
+                                    fontSize: 9,
+                                    height: 1.35,
+                                    color: AppColors.ink,
+                                  ),
+                                ),
+                              ),
+                            ),
+                            DataCell(
+                              Column(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    entry.ipReference,
+                                    style: const TextStyle(
+                                      fontSize: 8.4,
+                                      fontFamily: 'monospace',
+                                      color: AppColors.navyInk,
+                                    ),
+                                  ),
+                                  Text(
+                                    entry.hashReference,
+                                    style: const TextStyle(
+                                      fontSize: 8.2,
+                                      fontFamily: 'monospace',
+                                      color: AppColors.muted,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                    ],
+                  ),
+                ),
+                if (entries.length > 30)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(18, 8, 18, 4),
+                    child: Text(
+                      'Showing the latest 30 of ${entries.length} immutable '
+                      'entries. Older records remain retrievable from the '
+                      'AICTE cold-storage ledger.',
+                      style: const TextStyle(
+                        fontSize: 8.2,
+                        color: AppColors.muted,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+    );
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Phase 3: Finance e-NOC registry
+// -----------------------------------------------------------------------------
+
+class _EnocRegistryCard extends StatelessWidget {
+  const _EnocRegistryCard({required this.state});
+
+  final PortalState state;
+
+  @override
+  Widget build(BuildContext context) {
+    final records = state.issuedEnocs;
+    return SectionCard(
+      title: 'Issued Digital e-NOC Registry',
+      subtitle:
+          'Every digitally signed release order generated by the Finance Bureau, with the net authorised amount and QR verification status.',
+      trailing: SoftChip(
+        label: '${records.length} e-NOCs issued',
+        icon: Icons.qr_code_2_rounded,
+        color: AppColors.emeraldDark,
+      ),
+      contentPadding: records.isEmpty
+          ? EdgeInsets.zero
+          : const EdgeInsets.only(bottom: 8),
+      child: records.isEmpty
+          ? const EmptyState(
+              title: 'No e-NOCs issued yet',
+              message:
+                  'Approve a full or partial release and the digitally signed certificate will be registered here for bank verification.',
+              icon: Icons.description_rounded,
+              color: AppColors.muted,
+            )
+          : TableScroll(
+              minWidth: 1080,
+              child: DataTable(
+                horizontalMargin: 20,
+                columnSpacing: 22,
+                headingRowHeight: 44,
+                dataRowMinHeight: 58,
+                dataRowMaxHeight: 66,
+                headingRowColor: const WidgetStatePropertyAll(
+                  AppColors.surfaceSoft,
+                ),
+                headingTextStyle: const TextStyle(
+                  fontSize: 9,
+                  fontWeight: FontWeight.w900,
+                  letterSpacing: 0.8,
+                  color: AppColors.muted,
+                ),
+                dividerThickness: 1,
+                border: const TableBorder(
+                  horizontalInside: BorderSide(color: AppColors.softBorder),
+                ),
+                columns: const [
+                  DataColumn(label: Text('e-NOC / FDR')),
+                  DataColumn(label: Text('INSTITUTE')),
+                  DataColumn(label: Text('BANK / IFSC')),
+                  DataColumn(label: Text('NET AUTHORISED')),
+                  DataColumn(label: Text('STATUS')),
+                  DataColumn(label: Text('CERTIFICATE')),
+                ],
+                rows: records.map((record) {
+                  return DataRow(
+                    cells: [
+                      DataCell(
+                        Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              record.enocNumber ?? '—',
+                              style: const TextStyle(
+                                fontSize: 9.6,
+                                fontWeight: FontWeight.w800,
+                                color: AppColors.indigo,
+                              ),
+                            ),
+                            Text(
+                              record.id,
+                              style: const TextStyle(
+                                fontSize: 8.8,
+                                color: AppColors.muted,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      DataCell(
+                        SizedBox(
+                          width: 210,
+                          child: Text(
+                            record.instituteName,
+                            style: const TextStyle(
+                              fontSize: 9.4,
+                              color: AppColors.ink,
+                              height: 1.35,
+                            ),
+                          ),
+                        ),
+                      ),
+                      DataCell(
+                        Text(
+                          '${bankAbbreviation(record.bankName)} • ${record.ifsc}',
+                          style: const TextStyle(
+                            fontSize: 8.8,
+                            color: AppColors.muted,
+                          ),
+                        ),
+                      ),
+                      DataCell(
+                        Text(
+                          inr(record.releasedAmount ?? record.netPayable),
+                          style: const TextStyle(
+                            fontSize: 10,
+                            fontWeight: FontWeight.w900,
+                            color: AppColors.emeraldDark,
+                          ),
+                        ),
+                      ),
+                      DataCell(StatusPill(status: record.status)),
+                      DataCell(
+                        SizedBox(
+                          width: 210,
+                          child: AppButton(
+                            label: 'View / Download Digital e-NOC',
+                            icon: Icons.qr_code_2_rounded,
+                            dense: true,
+                            color: AppColors.emeraldDark,
+                            onPressed: () =>
+                                showEnocDialog(context, state, record),
+                          ),
+                        ),
+                      ),
+                    ],
+                  );
+                }).toList(),
+              ),
+            ),
     );
   }
 }

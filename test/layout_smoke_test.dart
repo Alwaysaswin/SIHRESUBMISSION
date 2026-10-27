@@ -74,7 +74,9 @@ void main() {
   testWidgets('finance partial release dialog opens', (tester) async {
     final state = PortalState()..switchRole(UserRole.finance);
     await pumpShell(tester, state, const Size(1440, 1000));
-    final releaseFinder = find.text('Approve Partial Release').first;
+    final releaseFinder = find
+        .text('Process Settlement & Deduct Penalty')
+        .first;
     await tester.ensureVisible(releaseFinder);
     await tester.pumpAndSettle();
     await tester.tap(releaseFinder);
