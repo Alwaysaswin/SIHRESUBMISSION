@@ -2,6 +2,8 @@ require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
+const multer = require('multer');
+const Tesseract = require('tesseract.js');
 
 const app = express();
 app.use(cors());
@@ -846,4 +848,31 @@ app.post('/api/notifications/run-scheduler', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 5000;
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } });
+
+function extractFields(text) {
+  const clean = text.replace(/[ \t]+/g, ' ');
+  const ifsc = (clean.match(/\b[A-Z]{4}0[A-Z0-9]{6}\b/i) || [])[0];
+  const dateMatch = clean.match(/\b\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}\b/g) || [];
+  const fdr = (clean.match(/(?:FDR|F\.D\.R|Receipt|Deposit)\s*(?:No\.?|Number|#)?\s*[:\-]?\s*([A-Z0-9\-\/]{6,25})/i) || [])[1];
+  const amountMatch = clean.match(/(?:Rs\.?|INR|₹)\s*([\d,]+(?:\.\d{1,2})?)/i);
+
+  return {
+    fdrNumber: fdr || null,
+    ifsc: ifsc ? ifsc.toUpperCase() : null,
+    dates: dateMatch,
+    amount: amountMatch ? amountMatch[1].replace(/,/g, '') : null,
+  };
+}
+
+app.post('/api/ocr/extract', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const result = await Tesseract.recognize(req.file.buffer, 'eng');
+    const text = result.data.text;
+    res.json({ rawText: text, fields: extractFields(text) });
+  } catch (e) {
+    res.status(500).json({ error: 'OCR failed', detail: e.message });
+  }
+});
 app.listen(PORT, () => console.log(`🚀 e-Kosh Backend running on http://localhost:${PORT}`));

@@ -2,9 +2,11 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
+import 'ocr_service.dart';
 
 void main() {
   runApp(const EKoshApp());
@@ -4313,11 +4315,9 @@ class _PortalShellState extends State<PortalShell> {
                       onToggleLanguage: _toggleLanguage,
                     ),
                     PortalTopBar(state: state),
-                    _GovTicker(hindi: _hindi),
                     Expanded(
                       child: Column(
                         children: [
-                          _GovBreadcrumbBar(state: state, hindi: _hindi),
                           Expanded(
                             child: LayoutBuilder(
                               builder: (context, constraints) {
@@ -4627,10 +4627,7 @@ class PortalTopBar extends StatelessWidget {
                             ),
                           ),
                         ),
-                        if (width >= 1500) ...[
-                          const _LiveDemoPill(),
-                          const SizedBox(width: 14),
-                        ],
+
                         _NotificationButton(state: state),
                         if (width >= 860) ...[
                           const SizedBox(width: 12),
@@ -8058,6 +8055,9 @@ class _InstituteSubmissionPageState extends State<InstituteSubmissionPage> {
   bool _ocrRunning = false;
   bool _ocrComplete = false;
   bool _documentAttached = false;
+  String? _selectedFileName;
+  int? _selectedFileSize;
+  String? _selectedFileExtension;
   double _ocrProgress = 0;
   Timer? _ocrTimer;
   static const _ocrConfidence = 98.4;
@@ -8081,6 +8081,7 @@ class _InstituteSubmissionPageState extends State<InstituteSubmissionPage> {
   }
 
   @override
+  @override
   void dispose() {
     _ocrTimer?.cancel();
     _ifscController.dispose();
@@ -8091,14 +8092,42 @@ class _InstituteSubmissionPageState extends State<InstituteSubmissionPage> {
     super.dispose();
   }
 
-  void _toggleDocument() {
+  Future<void> _pickDocument() async {
     if (_ocrRunning) return;
-    setState(() {
-      _documentAttached = !_documentAttached;
-      if (!_documentAttached) {
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: ['pdf', 'jpg', 'jpeg', 'png'],
+        withData: true,
+      );
+      if (result == null || result.files.isEmpty) {
+        return;
+      }
+      final file = result.files.first;
+      setState(() {
+        _documentAttached = true;
+        _selectedFileName = file.name;
+        final sizeBytes = file.size;
+        _selectedFileSize = sizeBytes;
+        final extension = file.extension?.toLowerCase();
+        _selectedFileExtension = extension;
         _ocrComplete = false;
         _ocrProgress = 0;
-      }
+      });
+    } catch (e) {
+      // Ignore errors, keep current state
+    }
+  }
+
+  void _removeDocument() {
+    if (_ocrRunning) return;
+    setState(() {
+      _documentAttached = false;
+      _selectedFileName = null;
+      _selectedFileSize = null;
+      _selectedFileExtension = null;
+      _ocrComplete = false;
+      _ocrProgress = 0;
     });
   }
 
@@ -8268,6 +8297,7 @@ class _InstituteSubmissionPageState extends State<InstituteSubmissionPage> {
             color: AppColors.emeraldDark,
           ),
         ),
+        const SizedBox(height: 24),
         LayoutBuilder(
           builder: (context, constraints) {
             final wide = constraints.maxWidth >= 980;
@@ -8292,24 +8322,25 @@ class _InstituteSubmissionPageState extends State<InstituteSubmissionPage> {
             final form = _buildSubmissionForm(context);
             if (!wide) {
               return Column(
-                children: [calculator, const SizedBox(height: 18), form],
+                children: [calculator, const SizedBox(height: 24), form],
               );
             }
             return Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Expanded(flex: 4, child: calculator),
-                const SizedBox(width: 18),
+                const SizedBox(width: 24),
                 Expanded(flex: 6, child: form),
               ],
             );
           },
         ),
+        const SizedBox(height: 24),
         SectionCard(
           title: 'Verification journey after submission',
           subtitle:
               'No manual follow-up is required — each stakeholder receives the request in their queue.',
-          contentPadding: const EdgeInsets.all(20),
+          contentPadding: const EdgeInsets.all(24),
           child: LayoutBuilder(
             builder: (context, constraints) {
               final wide = constraints.maxWidth >= 860;
@@ -8401,22 +8432,13 @@ class _InstituteSubmissionPageState extends State<InstituteSubmissionPage> {
     );
   }
 
-  Widget _buildOcrScanner(BuildContext context) {
-    final status = _ocrProgress < 0.55
-        ? 'Scanning document via Tesseract OCR... Extracting Joint Lien Metadata...'
-        : _ocrProgress < 0.85
-        ? 'Detecting joint holder signatures and bank seal...'
-        : 'Validating AICTE Member Secretary endorsement...';
+  Widget _buildDocumentUpload(BuildContext context) {
     return Container(
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
-        gradient: const LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [Color(0xFFF8FAFC), Color(0xFFEFF6FF)],
-        ),
+        color: Colors.white,
         borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: AppColors.indigo.withValues(alpha: 0.18)),
+        border: Border.all(color: AppColors.border),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -8427,13 +8449,13 @@ class _InstituteSubmissionPageState extends State<InstituteSubmissionPage> {
                 width: 34,
                 height: 34,
                 decoration: BoxDecoration(
-                  color: AppColors.indigo.withValues(alpha: 0.09),
+                  color: AppColors.navy.withValues(alpha: 0.09),
                   borderRadius: BorderRadius.circular(9),
                 ),
                 child: const Icon(
-                  Icons.auto_awesome_rounded,
+                  Icons.upload_file_rounded,
                   size: 18,
-                  color: AppColors.indigo,
+                  color: AppColors.navy,
                 ),
               ),
               const SizedBox(width: 10),
@@ -8442,7 +8464,7 @@ class _InstituteSubmissionPageState extends State<InstituteSubmissionPage> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      'AI OCR Document Scanner',
+                      'Upload Joint FDR Document',
                       style: TextStyle(
                         fontSize: 11.8,
                         fontWeight: FontWeight.w900,
@@ -8451,234 +8473,154 @@ class _InstituteSubmissionPageState extends State<InstituteSubmissionPage> {
                     ),
                     SizedBox(height: 2),
                     Text(
-                      'Upload the scanned joint FDR and auto-fill bank metadata.',
+                      'Attach your scanned Joint FDR in PDF, JPG, or PNG format.',
                       style: TextStyle(fontSize: 9.2, color: AppColors.muted),
                     ),
                   ],
                 ),
-              ),
-              const SizedBox(width: 8),
-              const SoftChip(
-                label: 'Tesseract • Simulated',
-                icon: Icons.memory_rounded,
-                color: AppColors.indigo,
               ),
             ],
           ),
           const SizedBox(height: 12),
           InkWell(
             borderRadius: BorderRadius.circular(10),
-            onTap: _toggleDocument,
+            onTap: _ocrRunning ? null : _pickDocument,
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 13),
+              padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 16),
               decoration: BoxDecoration(
-                color: Colors.white.withValues(alpha: 0.75),
+                color: AppColors.surfaceSoft,
                 borderRadius: BorderRadius.circular(10),
                 border: Border.all(
                   color: _documentAttached
                       ? AppColors.emerald.withValues(alpha: 0.38)
                       : AppColors.border,
+                  style: BorderStyle.solid,
                 ),
               ),
-              child: Row(
+              child: Column(
                 children: [
                   Icon(
                     _documentAttached
                         ? Icons.task_alt_rounded
                         : Icons.cloud_upload_rounded,
-                    size: 23,
+                    size: 32,
                     color: _documentAttached
                         ? AppColors.emeraldDark
-                        : AppColors.indigo,
+                        : AppColors.navy,
                   ),
-                  const SizedBox(width: 11),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
+                  const SizedBox(height: 8),
+                  Text(
+                    _documentAttached
+                        ? (_selectedFileName ?? 'Selected file')
+                        : 'Click or drag and drop to upload Joint FDR document',
+                    style: const TextStyle(
+                      fontSize: 10.6,
+                      fontWeight: FontWeight.w800,
+                      color: AppColors.navyInk,
+                    ),
+                    textAlign: TextAlign.center,
+                  ),
+                  const SizedBox(height: 6),
+                  if (_documentAttached)
+                    Text(
+                      _selectedFileSize != null
+                          ? '${(_selectedFileSize! / 1024.0 / 1024.0).toStringAsFixed(2)} MB'
+                          : '',
+                      style: const TextStyle(
+                        fontSize: 8.8,
+                        color: AppColors.muted,
+                      ),
+                      textAlign: TextAlign.center,
+                    )
+                  else
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
                       children: [
-                        Text(
-                          _documentAttached
-                              ? 'Joint_FDR_Scan_2026.pdf'
-                              : 'Drag & Drop Scanned Joint FDR (PDF/JPG)',
-                          style: const TextStyle(
-                            fontSize: 10.6,
-                            fontWeight: FontWeight.w800,
-                            color: AppColors.navyInk,
+                        OutlinedButton(
+                          onPressed: _ocrRunning ? null : _pickDocument,
+                          style: OutlinedButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 12,
+                              vertical: 6,
+                            ),
+                            visualDensity: VisualDensity.compact,
                           ),
+                          child: const Text('Choose File'),
                         ),
-                        const SizedBox(height: 2),
-                        Text(
-                          _documentAttached
-                              ? '3 pages • 1.8 MB • Click to remove'
-                              : 'or click to browse • max 10 MB',
-                          style: const TextStyle(
-                            fontSize: 8.8,
+                        const SizedBox(width: 8),
+                        const Text(
+                          'No file chosen',
+                          style: TextStyle(
+                            fontSize: 9,
                             color: AppColors.muted,
                           ),
                         ),
                       ],
                     ),
-                  ),
-                  SoftChip(
-                    label: _documentAttached ? 'Attached' : 'No file',
-                    icon: _documentAttached
-                        ? Icons.check_circle_rounded
-                        : Icons.attach_file_rounded,
-                    color: _documentAttached
-                        ? AppColors.emeraldDark
-                        : AppColors.muted,
-                  ),
+                  if (!_documentAttached) ...[
+                    const SizedBox(height: 4),
+                    const Text(
+                      'Supports PDF, JPG, PNG',
+                      style: TextStyle(
+                        fontSize: 8.8,
+                        color: AppColors.muted,
+                      ),
+                      textAlign: TextAlign.center,
+                    ),
+                  ],
                 ],
               ),
             ),
           ),
-          if (_ocrRunning) ...[
-            const SizedBox(height: 11),
-            ClipRRect(
-              borderRadius: BorderRadius.circular(999),
-              child: LinearProgressIndicator(
-                value: _ocrProgress,
-                minHeight: 7,
-                backgroundColor: AppColors.indigo.withValues(alpha: 0.10),
-                valueColor: const AlwaysStoppedAnimation(AppColors.indigo),
-              ),
-            ),
-            const SizedBox(height: 6),
+          if (_documentAttached) ...[
+            const SizedBox(height: 10),
             Row(
               children: [
-                const SizedBox(
-                  width: 12,
-                  height: 12,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2,
-                    valueColor: AlwaysStoppedAnimation(AppColors.indigo),
-                  ),
+                const Icon(
+                  Icons.description_rounded,
+                  size: 16,
+                  color: AppColors.navy,
                 ),
-                const SizedBox(width: 7),
+                const SizedBox(width: 8),
                 Expanded(
                   child: Text(
-                    status,
+                    _selectedFileName != null && _selectedFileSize != null
+                        ? '$_selectedFileName (${(_selectedFileSize! / 1024.0 / 1024.0).toStringAsFixed(2)} MB)'
+                        : (_selectedFileName ?? 'Selected file'),
                     style: const TextStyle(
-                      fontSize: 9.2,
-                      fontWeight: FontWeight.w700,
-                      color: AppColors.indigo,
+                      fontSize: 9.8,
+                      fontWeight: FontWeight.w600,
+                      color: AppColors.navyInk,
                     ),
                   ),
                 ),
-                Text(
-                  '${(_ocrProgress * 100).round()}%',
-                  style: const TextStyle(
-                    fontSize: 9.2,
-                    fontWeight: FontWeight.w900,
-                    color: AppColors.indigo,
+                TextButton.icon(
+                  onPressed: _removeDocument,
+                  icon: const Icon(Icons.close_rounded, size: 16),
+                  label: const Text('Remove'),
+                  style: TextButton.styleFrom(
+                    foregroundColor: AppColors.red,
+                    textStyle: const TextStyle(
+                      fontSize: 9.6,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                TextButton.icon(
+                  onPressed: _pickDocument,
+                  icon: const Icon(Icons.refresh_rounded, size: 16),
+                  label: const Text('Replace'),
+                  style: TextButton.styleFrom(
+                    foregroundColor: AppColors.navy,
+                    textStyle: const TextStyle(
+                      fontSize: 9.6,
+                      fontWeight: FontWeight.w700,
+                    ),
                   ),
                 ),
               ],
             ),
           ],
-          if (_ocrComplete && !_ocrRunning) ...[
-            const SizedBox(height: 11),
-            Container(
-              padding: const EdgeInsets.all(11),
-              decoration: BoxDecoration(
-                color: const Color(0xFFECFDF5),
-                borderRadius: BorderRadius.circular(10),
-                border: Border.all(color: const Color(0xFFA7F3D0)),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      const Icon(
-                        Icons.verified_rounded,
-                        size: 15,
-                        color: AppColors.emeraldDark,
-                      ),
-                      const SizedBox(width: 5),
-                      const Expanded(
-                        child: Text(
-                          'Extraction complete • 98.4% OCR MATCH',
-                          style: TextStyle(
-                            fontSize: 10,
-                            fontWeight: FontWeight.w900,
-                            color: AppColors.emeraldDark,
-                          ),
-                        ),
-                      ),
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 7,
-                          vertical: 3,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Colors.white,
-                          borderRadius: BorderRadius.circular(999),
-                          border: Border.all(
-                            color: AppColors.emerald.withValues(alpha: 0.3),
-                          ),
-                        ),
-                        child: Text(
-                          '${_ocrConfidence.toStringAsFixed(1)}% confidence',
-                          style: const TextStyle(
-                            fontSize: 8,
-                            fontWeight: FontWeight.w800,
-                            color: AppColors.emeraldDark,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 7),
-                  const Text(
-                    'Verified: Institute + AICTE Member Secretary',
-                    style: TextStyle(
-                      fontSize: 9.4,
-                      fontWeight: FontWeight.w800,
-                      color: AppColors.emeraldDark,
-                    ),
-                  ),
-                  const SizedBox(height: 7),
-                  Wrap(
-                    spacing: 6,
-                    runSpacing: 6,
-                    children: const [
-                      SoftChip(
-                        label: 'FDR-SBI-2026-88392',
-                        icon: Icons.confirmation_number_rounded,
-                        color: AppColors.navy,
-                      ),
-                      SoftChip(
-                        label: 'SBI • SBIN0004321',
-                        icon: Icons.account_balance_rounded,
-                        color: AppColors.navy,
-                      ),
-                      SoftChip(
-                        label: '₹15,00,000',
-                        icon: Icons.currency_rupee_rounded,
-                        color: AppColors.gold,
-                      ),
-                      SoftChip(
-                        label: '8-Year Maturity',
-                        icon: Icons.event_available_rounded,
-                        color: AppColors.orange,
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-          ],
-          const SizedBox(height: 11),
-          AppButton(
-            label: _ocrRunning
-                ? 'Scanning document via Tesseract OCR...'
-                : 'Run AI OCR Auto-Extraction',
-            icon: Icons.auto_awesome_rounded,
-            color: AppColors.indigo,
-            fullWidth: true,
-            onPressed: _ocrRunning ? null : _runOcr,
-          ),
         ],
       ),
     );
@@ -8694,13 +8636,13 @@ class _InstituteSubmissionPageState extends State<InstituteSubmissionPage> {
         icon: Icons.school_rounded,
         color: AppColors.navy,
       ),
-      contentPadding: const EdgeInsets.all(20),
+      contentPadding: const EdgeInsets.all(24),
       child: Form(
         key: _formKey,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            _buildOcrScanner(context),
+            _buildDocumentUpload(context),
             const SizedBox(height: 16),
             LayoutBuilder(
               builder: (context, constraints) {
@@ -8869,11 +8811,18 @@ class _InstituteSubmissionPageState extends State<InstituteSubmissionPage> {
             ),
             const SizedBox(height: 15),
             Container(
-              padding: const EdgeInsets.all(12),
+              padding: const EdgeInsets.all(14),
               decoration: BoxDecoration(
-                color: AppColors.surfaceSoft,
-                borderRadius: BorderRadius.circular(10),
-                border: Border.all(color: AppColors.softBorder),
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: const Color(0xFFE2E8F0)),
+                boxShadow: const [
+                  BoxShadow(
+                    color: Color(0x0F1E3A8A),
+                    blurRadius: 8,
+                    offset: Offset(0, 1),
+                  ),
+                ],
               ),
               child: Row(
                 children: [
@@ -8961,7 +8910,7 @@ class _DepositCalculatorCard extends StatelessWidget {
       title: 'Deposit Calculator',
       subtitle:
           'Estimate the security deposit mandated for the selected intake.',
-      contentPadding: const EdgeInsets.all(20),
+      contentPadding: const EdgeInsets.all(24),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -9005,15 +8954,18 @@ class _DepositCalculatorCard extends StatelessWidget {
           ),
           const SizedBox(height: 17),
           Container(
-            padding: const EdgeInsets.all(16),
+            padding: const EdgeInsets.all(20),
             decoration: BoxDecoration(
-              gradient: const LinearGradient(
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-                colors: [Color(0xFFFFFBEB), Color(0xFFFFF7ED)],
-              ),
-              borderRadius: BorderRadius.circular(13),
-              border: Border.all(color: AppColors.gold.withValues(alpha: 0.28)),
+              color: const Color(0xFFFEF3C7),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: const Color(0xFFFCD34D)),
+              boxShadow: const [
+                BoxShadow(
+                  color: Color(0x0F1E3A8A),
+                  blurRadius: 10,
+                  offset: Offset(0, 2),
+                ),
+              ],
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -9021,10 +8973,10 @@ class _DepositCalculatorCard extends StatelessWidget {
                 const Text(
                   'REQUIRED SECURITY DEPOSIT',
                   style: TextStyle(
-                    fontSize: 8.6,
-                    fontWeight: FontWeight.w900,
-                    letterSpacing: 0.95,
-                    color: AppColors.gold,
+                    fontSize: 9,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: 1.0,
+                    color: Color(0xFF92400E),
                   ),
                 ),
                 const SizedBox(height: 5),
@@ -9034,11 +8986,11 @@ class _DepositCalculatorCard extends StatelessWidget {
                   child: Text(
                     inr(calculatedDeposit),
                     style: const TextStyle(
-                      fontSize: 30,
-                      height: 1.05,
+                      fontSize: 32,
+                      height: 1.0,
                       fontWeight: FontWeight.w900,
-                      letterSpacing: -1,
-                      color: AppColors.navyInk,
+                      letterSpacing: -0.8,
+                      color: Color(0xFF78350F),
                     ),
                   ),
                 ),
@@ -9059,29 +9011,58 @@ class _DepositCalculatorCard extends StatelessWidget {
             label: 'AICTE base compliance deposit',
             value: inr(baseDeposit),
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: 10),
+          const Divider(height: 1, color: Color(0xFFE2E8F0)),
+          const SizedBox(height: 10),
           _CalculatorLine(
             label: 'Per-seat component',
             value: '${inr(perSeat)} × $intake',
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: 10),
+          const Divider(height: 1, color: Color(0xFFE2E8F0)),
+          const SizedBox(height: 10),
           _CalculatorLine(
             label: 'Per-seat subtotal',
             value: inr(perSeat * intake),
           ),
-          const SizedBox(height: 11),
-          const Divider(height: 1),
-          const SizedBox(height: 11),
-          _CalculatorLine(
-            label: 'Total payable',
-            value: inr(calculatedDeposit),
-            bold: true,
+          const SizedBox(height: 12),
+          const Divider(height: 1, color: Color(0xFFCBD5E1)),
+          const SizedBox(height: 12),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            decoration: BoxDecoration(
+              color: const Color(0xFFF1F5F9),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: const Color(0xFFCBD5E1)),
+            ),
+            child: Row(
+              children: [
+                const Expanded(
+                  child: Text(
+                    'Total payable',
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      color: AppColors.navyInk,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ),
+                Text(
+                  inr(calculatedDeposit),
+                  style: const TextStyle(
+                    fontSize: 13,
+                    color: AppColors.navyInk,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+              ],
+            ),
           ),
           const SizedBox(height: 17),
           AppButton(
             label: 'Apply Amount to Form',
             icon: Icons.calculate_rounded,
-            color: AppColors.gold,
+            color: AppColors.navy,
             fullWidth: true,
             onPressed: onApply,
           ),
