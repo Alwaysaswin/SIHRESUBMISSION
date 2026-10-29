@@ -2429,6 +2429,156 @@ class _PortalLoginPageState extends State<PortalLoginPage> {
     );
   }
 
+  Map<String, String> _demoCredentialsForRole(UserRole role) {
+    switch (role) {
+      case UserRole.institute:
+        return const {
+          'email': 'principal@kpr.edu.in',
+          'password': 'Kpr@2026',
+          'label': 'Institute Login'
+        };
+      case UserRole.bank:
+        return const {
+          'email': 'banknode@sbi.co.in',
+          'password': 'Sbi@2026',
+          'label': 'Bank Node'
+        };
+      case UserRole.ro:
+        return const {
+          'email': 'ro.south@aicte.gov.in',
+          'password': 'RoSouth@2026',
+          'label': 'AICTE RO'
+        };
+      case UserRole.finance:
+        return const {
+          'email': 'finance.hq@aicte.gov.in',
+          'password': 'Finance@2026',
+          'label': 'Finance HQ'
+        };
+    }
+  }
+
+  void _autoFillDemoCredentials() {
+    final creds = _demoCredentialsForRole(_selected);
+    setState(() {
+      _userIdController.text = creds['email']!;
+      _passwordController.text = creds['password']!;
+      _captchaInputController.text = _captchaCode;
+      _error = null;
+    });
+  }
+
+  Widget _buildDemoCredentialsShortcut() {
+    final creds = _demoCredentialsForRole(_selected);
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: _autoFillDemoCredentials,
+        borderRadius: BorderRadius.circular(8),
+        hoverColor: const Color(0xFFF8FAFC),
+        splashColor: const Color(0xFFE2E8F0),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          decoration: BoxDecoration(
+            color: const Color(0xFFF8FAFC),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(
+              color: const Color(0xFFCBD5E1),
+              style: BorderStyle.solid,
+              width: 1,
+            ),
+          ),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              const Icon(
+                Icons.key_outlined,
+                size: 16,
+                color: _govNavy,
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Row(
+                      children: [
+                        Text(
+                          creds['label'] ?? _tabLabel(_selected),
+                          style: const TextStyle(
+                            fontSize: 9,
+                            fontWeight: FontWeight.w800,
+                            color: _govInk,
+                            letterSpacing: 0.3,
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 6, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFE0F2FE),
+                            borderRadius: BorderRadius.circular(4),
+                            border: Border.all(color: const Color(0xFF7DD3FC)),
+                          ),
+                          child: const Text(
+                            'Click to Auto-Fill',
+                            style: TextStyle(
+                              fontSize: 7.5,
+                              fontWeight: FontWeight.w700,
+                              color: Color(0xFF0369A1),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    RichText(
+                      text: TextSpan(
+                        style: const TextStyle(
+                          fontSize: 8.5,
+                          color: _govInk,
+                          height: 1.4,
+                        ),
+                        children: [
+                          const TextSpan(
+                            text: 'Email/ID: ',
+                            style: TextStyle(fontWeight: FontWeight.w700),
+                          ),
+                          TextSpan(
+                            text: creds['email'] ?? '',
+                            style:
+                                const TextStyle(fontWeight: FontWeight.w600),
+                          ),
+                          const TextSpan(text: '   |   '),
+                          const TextSpan(
+                            text: 'Password: ',
+                            style: TextStyle(fontWeight: FontWeight.w700),
+                          ),
+                          TextSpan(
+                            text: creds['password'] ?? '',
+                            style:
+                                const TextStyle(fontWeight: FontWeight.w600),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const Icon(
+                Icons.touch_app_outlined,
+                size: 16,
+                color: AppColors.muted,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildSsoCard(_GovPalette palette) {
     final account = credentialFor(_selected);
     return Container(
@@ -2938,6 +3088,8 @@ class _PortalLoginPageState extends State<PortalLoginPage> {
                           ),
                   ),
                 ),
+                const SizedBox(height: 12),
+                _buildDemoCredentialsShortcut(),
                 const SizedBox(height: 8),
                 Row(
                   children: [
