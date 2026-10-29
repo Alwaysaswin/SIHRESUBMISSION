@@ -3305,7 +3305,17 @@ class _PasswordRecoveryDialogState extends State<_PasswordRecoveryDialog> {
                         fontSize: 10.5,
                         fontWeight: FontWeight.w600,
                       ),
-                      decoration: _fieldDecoration('New Password'),
+                      decoration: _fieldDecoration('New Password').copyWith(
+                        suffixIcon: IconButton(
+                          tooltip: 'Show password',
+                          onPressed: () {},
+                          icon: const Icon(
+                            Icons.visibility_off_outlined,
+                            size: 18,
+                            color: AppColors.muted,
+                          ),
+                        ),
+                      ),
                     ),
                     const SizedBox(height: 9),
                     TextField(
@@ -3318,7 +3328,17 @@ class _PasswordRecoveryDialogState extends State<_PasswordRecoveryDialog> {
                         fontSize: 10.5,
                         fontWeight: FontWeight.w600,
                       ),
-                      decoration: _fieldDecoration('Confirm New Password'),
+                      decoration: _fieldDecoration('Confirm New Password').copyWith(
+                        suffixIcon: IconButton(
+                          tooltip: 'Show password',
+                          onPressed: () {},
+                          icon: const Icon(
+                            Icons.visibility_off_outlined,
+                            size: 18,
+                            color: AppColors.muted,
+                          ),
+                        ),
+                      ),
                     ),
                     const SizedBox(height: 5),
                     const Text(
