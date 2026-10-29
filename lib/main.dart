@@ -2237,6 +2237,32 @@ class _PortalLoginPageState extends State<PortalLoginPage> {
     setState(() {
       _selected = role;
       _error = null;
+      _captchaInputController.clear();
+      _refreshCaptcha();
+    });
+    _fillDemoCredentialsForRole(role);
+  }
+
+  void _fillDemoCredentialsForRole(UserRole role) {
+    setState(() {
+      switch (role) {
+        case UserRole.institute:
+          _userIdController.text = 'principal@kpr.edu.in';
+          _passwordController.text = 'Kpr@2026';
+          break;
+        case UserRole.bank:
+          _userIdController.text = 'banknode@sbi.co.in';
+          _passwordController.text = 'Sbi@2026';
+          break;
+        case UserRole.ro:
+          _userIdController.text = 'ro.south@aicte.gov.in';
+          _passwordController.text = 'RoSouth@2026';
+          break;
+        case UserRole.finance:
+          _userIdController.text = 'finance.hq@aicte.gov.in';
+          _passwordController.text = 'Finance@2026';
+          break;
+      }
     });
   }
 
