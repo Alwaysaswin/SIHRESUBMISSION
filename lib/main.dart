@@ -20,7 +20,7 @@ const double kPortalTextScale = 1.4;
 const String _demoOtp = '654321';
 
 /// Node/Express + MongoDB API that backs the SSO gateway and live dashboards.
-const String kApiBaseUrl = 'http://localhost:5000';
+const String kApiBaseUrl = 'https://sihresubmission.onrender.com/';
 
 /// Outcome of a database-backed SSO call. [unavailable] keeps the offline demo
 /// path working when the API cannot be reached.
@@ -8550,10 +8550,7 @@ class _InstituteSubmissionPageState extends State<InstituteSubmissionPage> {
                         const SizedBox(width: 8),
                         const Text(
                           'No file chosen',
-                          style: TextStyle(
-                            fontSize: 9,
-                            color: AppColors.muted,
-                          ),
+                          style: TextStyle(fontSize: 9, color: AppColors.muted),
                         ),
                       ],
                     ),
@@ -8561,10 +8558,7 @@ class _InstituteSubmissionPageState extends State<InstituteSubmissionPage> {
                     const SizedBox(height: 4),
                     const Text(
                       'Supports PDF, JPG, PNG',
-                      style: TextStyle(
-                        fontSize: 8.8,
-                        color: AppColors.muted,
-                      ),
+                      style: TextStyle(fontSize: 8.8, color: AppColors.muted),
                       textAlign: TextAlign.center,
                     ),
                   ],
