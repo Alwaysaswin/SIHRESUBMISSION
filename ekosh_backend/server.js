@@ -876,13 +876,29 @@ app.post('/api/ocr/extract', upload.single('file'), async (req, res) => {
   }
 });
 const path = require('path');
+const fs = require('fs');
 
-// Flutter web static files-ai serve panna (server.js root-la iruntha 'build/web', ekosh_backend kulla iruntha '../build/web')
-const webBuildPath = path.join(__dirname, 'build', 'web'); 
+// build/web folder root-la irundhaalum sari, ekosh_backend veliya irundhaalum sari auto-va edukkum
+const possiblePaths = [
+  path.join(__dirname, 'build', 'web'),
+  path.join(__dirname, '..', 'build', 'web'),
+  path.join(process.cwd(), 'build', 'web'),
+  path.join(process.cwd(), '..', 'build', 'web')
+];
+
+const webBuildPath = possiblePaths.find(p => fs.existsSync(path.join(p, 'index.html'))) || possiblePaths[0];
+
 app.use(express.static(webBuildPath));
 
-// Endha route-ku ponாலும் Flutter index.html-ai open panna
+// Website open pannumbothu Flutter UI-ai kaatta:
 app.get('/{*splat}', (req, res) => {
-  res.sendFile(path.join(webBuildPath, 'index.html'));
+  const indexFile = path.join(webBuildPath, 'index.html');
+  if (fs.existsSync(indexFile)) {
+    res.sendFile(indexFile);
+  } else {
+    res.status(404).send(`Flutter build/web folder missing at: ${indexFile}`);
+  }
 });
+
+// Idhuku keela dhaan unga app.listen(...) irukkanum!
 app.listen(PORT, () => console.log(`🚀 e-Kosh Backend running on http://localhost:${PORT}`));
