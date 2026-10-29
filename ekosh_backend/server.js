@@ -875,4 +875,14 @@ app.post('/api/ocr/extract', upload.single('file'), async (req, res) => {
     res.status(500).json({ error: 'OCR failed', detail: e.message });
   }
 });
+const path = require('path');
+
+// Flutter web static files-ai serve panna (server.js root-la iruntha 'build/web', ekosh_backend kulla iruntha '../build/web')
+const webBuildPath = path.join(__dirname, 'build', 'web'); 
+app.use(express.static(webBuildPath));
+
+// Endha route-ku ponாலும் Flutter index.html-ai open panna
+app.get('/{*splat}', (req, res) => {
+  res.sendFile(path.join(webBuildPath, 'index.html'));
+});
 app.listen(PORT, () => console.log(`🚀 e-Kosh Backend running on http://localhost:${PORT}`));
